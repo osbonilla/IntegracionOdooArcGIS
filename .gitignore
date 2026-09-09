@@ -1,0 +1,8 @@
+.env
+integration-api/.env
+scripts/.env
+__pycache__/
+*.pyc
+.venv/
+odoo/addons/*
+!odoo/addons/.gitkeep

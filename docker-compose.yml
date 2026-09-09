@@ -1,0 +1,71 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────
+# DEMO: Integración Odoo <-> ArcGIS Online / ArcGIS Enterprise
+# ─────────────────────────────────────────────────────────────
+# db                -> PostgreSQL exclusivo de Odoo (motor interno del ERP)
+# odoo              -> Instancia Odoo Community local
+# integration-api   -> Servicio FastAPI que hace de puente Odoo <-> ArcGIS
+# ─────────────────────────────────────────────────────────────
+
+services:
+  db:
+    image: postgres:15
+    container_name: odoo_arcgis_db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=postgres
+      - POSTGRES_USER=${ODOO_DB_USER:-odoo}
+      - POSTGRES_PASSWORD=${ODOO_DB_PASSWORD:-odoo}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - odoo-db-data:/var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ODOO_DB_USER:-odoo}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend
+
+  odoo:
+    image: odoo:18.0
+    container_name: odoo_arcgis_odoo
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8069:8069"
+    environment:
+      - HOST=db
+      - USER=${ODOO_DB_USER:-odoo}
+      - PASSWORD=${ODOO_DB_PASSWORD:-odoo}
+    volumes:
+      - odoo-web-data:/var/lib/odoo
+      - ./odoo/config:/etc/odoo
+      - ./odoo/addons:/mnt/extra-addons
+    networks:
+      - backend
+
+  integration-api:
+    build:
+      context: ./integration-api
+    container_name: odoo_arcgis_integration_api
+    restart: unless-stopped
+    depends_on:
+      - odoo
+    env_file:
+      - ./integration-api/.env
+    ports:
+      - "8000:8000"
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  odoo-db-data:
+  odoo-web-data:
