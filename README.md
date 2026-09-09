@@ -99,7 +99,7 @@ Enterprise mediante una única variable de configuración (`ARCGIS_URL`).
 ## 3. Estructura del proyecto
 
 ```text
-odoo-arcgis-demo/
+IntegracionOdooArcGIS/
 ├── docker-compose.yml
 ├── .env.example                  # credenciales de la BD de Odoo
 ├── odoo/
