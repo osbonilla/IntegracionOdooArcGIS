@@ -12,11 +12,6 @@ logger = logging.getLogger("integration.main")
 
 app = FastAPI(
     title="Odoo <-> ArcGIS Integration API",
-    description=(
-        "Microservicio de demostración que sincroniza contactos geolocalizados "
-        "de Odoo hacia una Hosted Feature Layer en ArcGIS Online / Enterprise, "
-        "y recibe actualizaciones inversas vía webhook."
-    ),
     version="1.0.0",
 )
 
@@ -68,14 +63,9 @@ def last_sync() -> SyncSummary | None:
 
 @app.post("/webhook/arcgis")
 def arcgis_webhook(payload: ArcGISWebhookPayload) -> dict:
-    """
-    Endpoint que recibe notificaciones de ArcGIS Online (Webhooks de Feature
-    Layer) cuando una feature es editada. Ver README para cómo configurar
-    el webhook en AGOL y adaptar el payload real al esquema esperado aquí.
-    """
     try:
         sync.handle_arcgis_webhook(
-            payload.odoo_partner_id, payload.new_status, payload.note
+            payload.odoo_task_id, payload.new_status, payload.note
         )
         return {"status": "applied"}
     except Exception as exc:  # noqa: BLE001

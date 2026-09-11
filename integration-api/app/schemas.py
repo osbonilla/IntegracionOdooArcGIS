@@ -13,11 +13,9 @@ class SyncSummary(BaseModel):
 
 class ArcGISWebhookPayload(BaseModel):
     """
-    Payload simplificado esperado desde un webhook de ArcGIS Online
-    (Feature Layer -> Webhook -> FeaturesUpdated / FeaturesCreated).
-    Ver README sección "Flujo inverso ArcGIS -> Odoo" para el formato real
-    que entrega AGOL y cómo adaptarlo si difiere.
+    Payload simplificado esperado desde un webhook de ArcGIS Online.
+    Ver README sección 6 para el formato real de AGOL y cómo adaptarlo.
     """
-    odoo_partner_id: int
+    odoo_task_id: int
     new_status: Optional[str] = None
     note: Optional[str] = None

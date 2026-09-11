@@ -6,10 +6,9 @@ un microservicio intermediario que sincroniza datos de negocio hacia una
 capa geoespacial y procesa actualizaciones en sentido inverso.
 
 El caso de uso documentado corresponde a la gestión de solicitudes
-ciudadanas en un municipio: un escenario representativo para instituciones
-que operan Odoo y evalúan incorporar capacidades de análisis y
-visualización espacial sin reemplazar el ERP ni duplicar procesos de
-negocio.
+ciudadanas en municipios: un escenario representativo para instituciones
+que operan **Odoo** y evalúan incorporar capacidades de análisis y
+visualización espacial sin reemplazar el ERP.
 
 ---
 
@@ -43,12 +42,32 @@ bidireccional: el estado de una solicitud puede modificarse desde ArcGIS y
 queda reflejado en Odoo, en lugar de operar como una exportación
 unidireccional estática.
 
-> El caso de uso emplea `res.partner` en lugar de un modelo de negocio
-> dedicado, dado que Odoo Community incluye por defecto los campos
-> `partner_latitude` / `partner_longitude` (módulo `base_geolocalize`). Para
-> un despliegue productivo se recomienda un modelo propio (`project.task`,
-> `helpdesk.ticket` o un módulo custom) — ver sección
-> [10. Consideraciones para un despliegue productivo](#10-consideraciones-para-un-despliegue-productivo).
+### 1.3. Justificación y limitación del modelo de datos
+
+El proyecto registra cada solicitud ciudadana como un contacto
+(`res.partner`) — es decir, dentro del mismo módulo que Odoo usa para el
+directorio de clientes, proveedores y empleados de la organización. Esto
+es una simplificación deliberada para el prototipo, no una recomendación
+de diseño:
+
+- **Ventaja técnica:** `res.partner` incluye por defecto los campos
+  `partner_latitude` / `partner_longitude` (módulo `base_geolocalize`),
+  lo que permite construir la demo sin instalar ni programar un módulo
+  adicional.
+- **Limitación conceptual:** una solicitud ciudadana no es un contacto de
+  la organización — es un caso o trámite, con estado, fecha y ciclo de
+  vida propios. Mezclarlo con el directorio de contactos sirve para
+  probar el mecanismo de integración, pero no corresponde a un modelo de
+  datos correcto para un uso real.
+
+Para un piloto real con un municipio, la alternativa de menor esfuerzo es
+el módulo **Helpdesk** de Odoo (incluido en Community): modela cada
+solicitud como un ticket con estados (`Nuevo`, `En progreso`, `Resuelto`)
+— semánticamente correcto para el caso de uso — y cada ticket se vincula
+a un contacto (el ciudadano) que sí lleva las coordenadas. La alternativa
+más robusta, para producción, es un módulo custom (`municipio_solicitudes`)
+con su propio ciclo de vida — ver sección
+[10. Consideraciones para un despliegue productivo](#10-consideraciones-para-un-despliegue-productivo).
 
 ---
 
@@ -94,6 +113,15 @@ requiere licenciamiento e infraestructura propia de Esri. El microservicio
 de integración está escrito para operar indistintamente contra AGOL o
 Enterprise mediante una única variable de configuración (`ARCGIS_URL`).
 
+> **Nota de entorno de referencia:** en el entorno donde se validó este
+> proyecto, ArcGIS Enterprise corre en el mismo equipo Windows que Docker
+> Desktop (típico en laboratorios/entornos de capacitación de Esri, con
+> hostname resuelto vía mDNS/LLMNR local en vez de DNS corporativo). Esto
+> introduce particularidades de red documentadas en la sección
+> [9. Troubleshooting](#9-troubleshooting) que no aplican a un despliegue
+> donde Enterprise está en infraestructura de red separada con DNS
+> corporativo real.
+
 ---
 
 ## 3. Estructura del proyecto
@@ -130,9 +158,13 @@ IntegracionOdooArcGIS/
 - Docker y Docker Compose v2
 - Cuenta ArcGIS Online (developer/trial es suficiente) o acceso a un
   ArcGIS Enterprise con permisos para publicar Hosted Feature Layers
-- Python 3.10+ para la ejecución de los scripts en `scripts/` (fuera de
-  Docker)
+- Python 3.10 – 3.13 para la ejecución de los scripts en `scripts/` (fuera
+  de Docker) — el paquete `arcgis` no soporta versiones más nuevas de
+  Python; verificar con `python --version` antes de crear el entorno
+  virtual
 - Puertos disponibles: `8069` (Odoo), `8000` (Integration API)
+- Si el Enterprise a usar tiene certificado autofirmado (común en
+  entornos de laboratorio), ver `ARCGIS_VERIFY_CERT` en la sección 5.3
 
 ---
 
@@ -154,9 +186,15 @@ En `http://localhost:8069`, creación de la base de datos:
   `integration-api/.env` y con `dbfilter` en `odoo/config/odoo.conf`)
 - Usuario/contraseña de administrador: de libre elección, siempre que se
   reflejen en `ODOO_USERNAME` / `ODOO_PASSWORD` de `integration-api/.env`
+- **`admin_passwd` de `odoo/config/odoo.conf`:** cambiarlo por un valor no
+  trivial antes de crear la base — protege la creación/eliminación de
+  bases de datos completas. No reutilizar ese mismo valor como password
+  del usuario administrador de la aplicación (son dos niveles de
+  privilegio distintos).
 
 El módulo **Contactos** está activo por defecto; no se requieren módulos
-adicionales para este caso de uso.
+adicionales para el caso de uso tal como está implementado (ver limitación
+del modelo de datos en la sección 1.3).
 
 ### 5.2. Hosted Feature Layer en ArcGIS
 
@@ -174,6 +212,16 @@ python create_arcgis_feature_layer.py
 El script imprime el `Item ID` de la capa creada, requerido en el paso
 siguiente.
 
+**Alternativa validada si el script anterior falla con error 500** (típico
+cuando el Hosting Server de Enterprise no está disponible o mal federado
+en el entorno de prueba): publicar la capa manualmente subiendo un CSV con
+columnas `odoo_partner_id, name, address, city, phone, email, status,
+latitude, longitude` a **Content → New Item** en el Portal. El nombre real
+del campo ObjectID varía según el método de publicación (`OBJECTID` al
+crear vía script, `objectid` al publicar desde CSV); `arcgis_client.py` lo
+detecta dinámicamente en tiempo de ejecución, por lo que ambos métodos son
+compatibles sin cambios de código.
+
 ### 5.3. Microservicio de integración
 
 ```bash
@@ -186,6 +234,28 @@ docker compose up -d --build integration-api
 docker compose logs -f integration-api
 ```
 
+**Variables adicionales según el entorno de ArcGIS:**
+
+| Variable | Cuándo se necesita |
+|---|---|
+| `ARCGIS_VERIFY_CERT=False` | Enterprise con certificado autofirmado (labs/entrenamiento). En producción usar un certificado válido y mantener `True`. |
+
+**Si el hostname del Enterprise no resuelve desde dentro del contenedor**
+(síntoma: `NameResolutionError`, aunque sí resuelve desde la máquina host
+— ver nota de entorno en la sección 2), agregar en `docker-compose.yml`,
+dentro del servicio `integration-api`:
+
+```yaml
+    extra_hosts:
+      - "tu-host.dominio.local:host-gateway"
+```
+
+`host-gateway` resuelve automáticamente a la IP del host sin necesidad de
+hardcodear una dirección — preferible a fijar una IP manualmente, que se
+desactualiza si la red cambia. Requiere `docker compose up -d
+--force-recreate integration-api` para tomar efecto (un `restart` no basta,
+porque no vuelve a leer `docker-compose.yml`).
+
 Verificación: `http://localhost:8000/health` → `{"status": "ok"}`
 Documentación interactiva (Swagger) en `http://localhost:8000/docs`.
 
@@ -197,7 +267,10 @@ python seed_odoo_demo_data.py
 ```
 
 El script crea 8 registros de ejemplo geolocalizados (coordenadas de
-referencia en Quito; editables directamente en el archivo).
+referencia en Quito; editables directamente en el archivo). Estos
+registros se crean directamente vía XML-RPC, sin pasar por la interfaz de
+Odoo — equivalen a solicitudes que ya existirían en el sistema al momento
+de correr la demo.
 
 ### 5.5. Ejecución de la sincronización
 
@@ -218,8 +291,8 @@ Respuesta esperada:
 }
 ```
 
-La capa resultante se visualiza en ArcGIS Online (Content → búsqueda por
-título) y admite la creación de un **Web Map** o **Dashboard** sobre ella.
+La capa resultante se visualiza en ArcGIS (Content → búsqueda por título)
+y admite la creación de un **Web Map** o **Dashboard** sobre ella.
 
 ### 5.6. Sincronización periódica (opcional)
 
@@ -266,14 +339,18 @@ correspondiente → chatter: se registra la nota enviada.
 
 El código de `arcgis_client.py` no cambia entre ambos escenarios: el
 paquete `arcgis` (ArcGIS API for Python) abstrae la diferencia. Las
-variaciones se limitan a la URL de conexión y al método de autenticación.
+variaciones se limitan a la URL de conexión, el método de autenticación y,
+en Enterprise con certificado autofirmado, `ARCGIS_VERIFY_CERT`.
 
 ---
 
 ## 8. Seguridad
 
 - Los archivos `.env` reales no deben incluirse en control de versiones
-  (excluidos vía `.gitignore`); `.env.example` se usa como plantilla.
+  (excluidos vía `.gitignore`) ni en paquetes compartidos manualmente
+  (zips, capturas de pantalla, tickets de soporte) — el `.gitignore`
+  protege commits, no evita que se incluyan al empaquetar el proyecto a
+  mano. `.env.example` se usa como plantilla.
 - Este proyecto emplea autenticación básica (usuario/password) contra
   ArcGIS por simplicidad. En un entorno productivo corresponde migrar a
   OAuth 2.0:
@@ -281,9 +358,17 @@ variaciones se limitan a la URL de conexión y al método de autenticación.
     `client_id` / `client_secret` (`GIS(url, client_id=..., client_secret=...)`).
   - Enterprise: evaluar IWA (Windows Integrated Auth) o certificados PKI
     según la infraestructura disponible.
+- `ARCGIS_VERIFY_CERT=False` deshabilita la validación de identidad del
+  servidor ArcGIS — aceptable únicamente en una red de laboratorio
+  controlada. Expone a un ataque de intermediario (MITM) si el tráfico
+  llegara a salir de esa red. La solución productiva es un certificado
+  firmado por una CA reconocida, o instalar la CA interna de la
+  organización en la imagen del microservicio (`update-ca-certificates`)
+  para mantener `True`.
 - El `admin_passwd` de `odoo/config/odoo.conf` corresponde únicamente a
   desarrollo local; debe modificarse y protegerse si el contenedor se
-  expone fuera de la red local.
+  expone fuera de la red local, y no debe coincidir con el password de
+  ningún usuario de la aplicación.
 - El endpoint `/webhook/arcgis` no debe exponerse públicamente sin
   autenticación adicional (validación de secreto compartido o restricción
   por origen) en un entorno productivo.
@@ -294,7 +379,7 @@ variaciones se limitan a la URL de conexión y al método de autenticación.
 
 ## 9. Troubleshooting
 
-| Síntoma                                            | Causa probable                                                       | Verificación                                                                 |
+| Síntoma                                            | Causa probable                                                       | Verificación / solución                                                          |
 |------------------------------------------------------|--------------------------------------------------------------------------|----------------------------------------------------------------------------------|
 | `integration-api` no arranca                         | Falta `.env` o falta `ARCGIS_FEATURE_LAYER_ITEM_ID`                     | `docker compose logs integration-api`                                           |
 | Error de autenticación con Odoo                      | `ODOO_DB` no coincide con la BD creada, o password incorrecto           | Login manual en `http://localhost:8069`                                         |
@@ -302,6 +387,10 @@ variaciones se limitan a la URL de conexión y al método de autenticación.
 | Error del paquete `arcgis` al conectar               | Credenciales incorrectas o Web Adaptor de Enterprise mal configurado    | `python -c "from arcgis.gis import GIS; GIS(url, user, pwd)"` en shell local     |
 | Feature Layer no se actualiza sin error reportado     | El `Item ID` en `.env` apunta a otra capa                               | Confirmar el Item ID impreso por `create_arcgis_feature_layer.py`               |
 | Contenedor `odoo` reinicia en bucle                   | Conflicto entre `dbfilter` de `odoo.conf` y el nombre real de la BD     | Ajustar `dbfilter` en `odoo/config/odoo.conf`                                   |
+| `NameResolutionError` hacia el host de Enterprise, pero resuelve desde la máquina host | Hostname `.local` resuelto vía mDNS/LLMNR de Windows; Docker no tiene acceso a ese resolver | `extra_hosts: ["host.dominio.local:host-gateway"]` en el servicio `integration-api` (ver 5.3) |
+| `SSLCertVerificationError: self-signed certificate`   | Certificado autofirmado del Enterprise no confiable dentro del contenedor | `ARCGIS_VERIFY_CERT=False` para lab; certificado válido o CA interna instalada para producción (ver sección 8) |
+| `"El nombre de campo \"OBJECTID\" no existe"`         | El nombre del campo ObjectID varía según el método de publicación de la capa (`OBJECTID` vs `objectid`) | Ya resuelto en `arcgis_client.py`: se detecta dinámicamente vía `layer.properties.objectIdField` |
+| Campos `latitude`/`longitude` vacíos en la tabla aunque el punto esté bien ubicado en el mapa | `arcgis_client.py` usa esas coordenadas solo para construir la geometría, no las escribe como atributos | Se detectan los campos existentes en la capa y se completan solo si existen (evita asumir un esquema fijo) |
 
 Comandos de diagnóstico:
 
@@ -321,24 +410,31 @@ Este proyecto constituye una prueba de concepto técnica y omite
 deliberadamente varios mecanismos requeridos en un entorno de producción.
 Para un despliegue productivo corresponde evaluar, como mínimo:
 
-1. **Modelo de negocio propio en Odoo**, en lugar de `res.partner`: módulo
-   custom (p. ej. `municipio_solicitudes`) con estados, SLA, adjuntos y
-   relación a `project.task` para asignación de cuadrillas.
+1. **Modelo de negocio correcto en Odoo**, en lugar de `res.partner` (ver
+   sección 1.3). Dos niveles de esfuerzo:
+   - Intermedio: módulo **Helpdesk** (incluido en Community), modelando
+     cada solicitud como ticket con estados, vinculado a un contacto
+     ciudadano para las coordenadas.
+   - Completo: módulo custom (p. ej. `municipio_solicitudes`) con
+     estados, SLA, adjuntos y relación a `project.task` para asignación
+     de cuadrillas.
 2. **OAuth 2.0** en ambos extremos (Odoo vía módulo `oauth2` / API keys;
    ArcGIS vía App Registration).
-3. **Idempotencia robusta**: reemplazar el matching por `OBJECTID`
+3. **Certificados válidos** en Enterprise (CA reconocida o interna de la
+   organización), eliminando la necesidad de `ARCGIS_VERIFY_CERT=False`.
+4. **Idempotencia robusta**: reemplazar el matching por ObjectID
    consultado en cada request por un campo indexado único y `upsert` en
    lote (`edit_features` admite arrays; en este proyecto se procesa
    registro por registro por claridad).
-4. **Cola de mensajes** (RabbitMQ/Redis) si el volumen de solicitudes lo
+5. **Cola de mensajes** (RabbitMQ/Redis) si el volumen de solicitudes lo
    justifica, en lugar de sincronización por polling.
-5. **Adaptador de webhook AGOL** (`adapt_agol_payload()`), dado que el
+6. **Adaptador de webhook AGOL** (`adapt_agol_payload()`), dado que el
    payload nativo de Esri difiere del esquema simplificado usado aquí.
-6. **Nginx + TLS** como reverse proxy si Odoo o el microservicio se
+7. **Nginx + TLS** como reverse proxy si Odoo o el microservicio se
    exponen fuera de la red interna de la organización.
-7. **Dashboard público de solo lectura**, separado del Web Map operativo
+8. **Dashboard público de solo lectura**, separado del Web Map operativo
    interno, si se requiere exposición ciudadana.
-8. **Logging y métricas centralizadas** (stack ELK, Grafana Loki u
+9. **Logging y métricas centralizadas** (stack ELK, Grafana Loki u
    equivalente) para operación en producción.
 
 ---
