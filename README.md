@@ -1,4 +1,4 @@
-# Integración Odoo ↔ ArcGIS Online / Enterprise — flujo de extremo a extremo
+# Integración Odoo ↔ ArcGIS Online / Enterprise — flujo end-to-end (E2E)
 
 Este proyecto muestra una integración entre **Odoo** y **ArcGIS Online / ArcGIS Enterprise** mediante un microservicio encargado de sincronizar información en ambos sentidos.
 
