@@ -183,16 +183,59 @@ método) se detecta dinámicamente en tiempo de ejecución.
 | **Con MFA o login corporativo (SSO)** | **App Authentication** (`ARCGIS_CLIENT_ID` / `ARCGIS_CLIENT_SECRET`) |
 | ArcGIS Enterprise con certificado autofirmado | Cualquiera de las dos anteriores + `ARCGIS_VERIFY_CERT=False` |
 
-**Registrar App Authentication (para cuentas con MFA):**
+**Registrar App Authentication (para cuentas con MFA) — pasos exactos:**
 
-1. AGOL → **Content → New item → Developer credentials → OAuth credentials**.
-2. Tipo de aplicación: **Application / server-to-server** (no el flujo de
-   usuario con redirect URL — ese requiere login interactivo).
-3. En la página de esas credenciales → **Application → Credentials**,
-   copia **Client ID** y **Client Secret**.
-4. En la misma sección → **Edit** → **Grant access to specific items** →
-   selecciona tu Feature Layer. Esto limita lo que esa aplicación puede
-   tocar, en vez de darle acceso a toda tu organización.
+Requiere una cuenta con user type **Creator** o superior (si no aparece
+la opción **Developer credentials** al crear un ítem, esa es la causa).
+
+1. En el Portal/AGOL, con sesión iniciada → **Content → My Content →
+   New item**.
+2. Click **Developer credentials**.
+3. En la pantalla de tipo de credencial, selecciona **OAuth 2.0
+   credentials** → **Next**.
+4. En **Where will you use these credentials?**, selecciona **Private
+   application with selected privileges and access** — esta es la
+   variante server-to-server (sin redirect URL ni login interactivo, que
+   es lo que necesita el microservicio) → **Next**.
+5. En **Item access**, selecciona **Grant access to specific items** →
+   **Browse items** → marca la Hosted Feature Layer publicada en la
+   sección 5.2 → **Next**. Esto limita el alcance de la credencial a esa
+   capa puntual, en vez de darle acceso a todo el contenido de la
+   organización.
+6. En **Privileges**, dentro de la categoría **Features**, marca:
+   - **Edit with full control** (privilegio `features:user:fullEdit`) —
+     es el que necesita este proyecto: permite **crear, actualizar y
+     eliminar** features en una Hosted Feature Layer sin depender de las
+     opciones de edición configuradas manualmente en la capa. Lo usan
+     tanto `/sync/run` (Odoo → ArcGIS, crea y actualiza features) como
+     `/sync/reverse` (escribe de vuelta el `odoo_partner_id` en la
+     feature para marcarla como ya vinculada).
+   - Alternativa más restrictiva: **Edit** (`features:user:edit`) —
+     solo funciona si la capa ya tiene habilitadas manualmente las
+     opciones Create/Update/Delete en **Settings → Editing**. Si no
+     estás seguro, usa **Edit with full control**.
+   → **Next**.
+7. En **Referrer URLs**, déjalo en blanco → **Next**. Los referrers
+   restringen tokens usados desde un navegador; el microservicio llama
+   a la API desde el backend (server-to-server), no aplica.
+8. Completa **Title** (p. ej. `odoo-arcgis-integration-api`), **Folder**
+   (crea `Developer credentials` si no existe) y **Tags** → **Next** →
+   revisa el **Summary** → **Create**.
+9. En la página del ítem recién creado, baja hasta la sección
+   **Credentials** y copia **Client ID** y **Client Secret** → pégalos
+   en `integration-api/.env` como `ARCGIS_CLIENT_ID` y
+   `ARCGIS_CLIENT_SECRET`. El Client Secret solo se muestra completo la
+   primera vez; si lo pierdes, tenés que regenerarlo desde ahí mismo.
+
+**Editar acceso o privilegios después de creada la credencial:** página
+del ítem → **Settings** → bajo **Application → Credentials** → **Edit**
+(aparece un aviso de confirmación → **Continue**) → repetís los pasos de
+**Item access** y **Privileges** de arriba.
+
+> En ArcGIS Enterprise el flujo es idéntico; solo cambia que accedés
+> desde la URL del Portal (Web Adaptor) en vez de `arcgis.com`, y el
+> rol necesario en el Portal equivale a Creator/Publisher según la
+> versión.
 
 Con `ARCGIS_CLIENT_ID` y `ARCGIS_CLIENT_SECRET` completos en el `.env`,
 `arcgis_client.py` los usa automáticamente en lugar de usuario/password
@@ -224,7 +267,50 @@ python seed_odoo_demo_data.py
 Crea 8 solicitudes de ejemplo (proyecto + tareas + contactos vinculados)
 con coordenadas de referencia en Quito.
 
-### 5.6. Sincronización manual
+### 5.6. Sincronización automática (recomendado)
+
+Este es el modo pensado para que Odoo → ArcGIS quede corriendo solo, sin
+tener que disparar nada a mano.
+
+**Por sondeo periódico** (ambas direcciones — Odoo → ArcGIS y ArcGIS →
+Odoo corren cada una en su propio job):
+
+Cambia `SYNC_INTERVAL_MINUTES=0` por `SYNC_INTERVAL_MINUTES=2` en
+`integration-api/.env` (o el valor en minutos que prefieras), guarda, y:
+
+```bash
+docker compose up -d --force-recreate integration-api
+```
+
+(`--force-recreate`, no `restart` — un `restart` no vuelve a leer el
+`.env`.)
+
+Verificá que quedó activo:
+
+```bash
+docker compose logs -f integration-api
+# esperar: "Sincronización automática (ambas direcciones) activada cada 2 minutos"
+```
+
+A partir de ahí, cualquier solicitud creada o editada en Odoo aparece en
+la Hosted Feature Layer dentro del intervalo configurado, sin volver a
+tocar el microservicio.
+
+**Push inmediato desde Odoo** (opcional, además del sondeo — Odoo →
+ArcGIS sin esperar el intervalo):
+
+1. Odoo → activar modo desarrollador (Ajustes → Activar el modo
+   desarrollador) → **Técnico → Automatizaciones → Nueva**.
+2. Modelo: `Project Task`.
+3. Disparador: **Al crear** y **Al modificar**.
+4. Acción: **Enviar notificación webhook** → URL
+   `http://integration-api:8000/webhook/odoo` (nombre del servicio en la
+   red de Docker, no `localhost`).
+
+### 5.7. Sincronización manual (opcional, para pruebas puntuales)
+
+Para forzar una corrida sin esperar el intervalo configurado — útil al
+probar el despliegue por primera vez o para depurar:
 
 ```bash
 curl -X POST http://localhost:8000/sync/run
@@ -240,28 +326,6 @@ curl -X POST http://localhost:8000/sync/run
   "errors": []
 }
 ```
-
-### 5.7. Sincronización automática
-
-**Por sondeo periódico** (ambas direcciones): en `integration-api/.env`,
-`SYNC_INTERVAL_MINUTES=2` (o el valor deseado) y:
-
-```bash
-docker compose up -d --force-recreate integration-api
-```
-
-(`--force-recreate`, no `restart` — un `restart` no vuelve a leer el
-`.env`.)
-
-**Push inmediato desde Odoo** (Odoo → ArcGIS sin esperar el intervalo):
-
-1. Odoo → activar modo desarrollador (Ajustes → Activar el modo
-   desarrollador) → **Técnico → Automatizaciones → Nueva**.
-2. Modelo: `Project Task`.
-3. Disparador: **Al crear** y **Al modificar**.
-4. Acción: **Enviar notificación webhook** → URL
-   `http://integration-api:8000/webhook/odoo` (nombre del servicio en la
-   red de Docker, no `localhost`).
 
 ---
 
