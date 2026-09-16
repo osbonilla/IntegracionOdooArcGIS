@@ -134,6 +134,31 @@ IntegracionOdooArcGIS/
 
 ## 5. Despliegue
 
+Antes del detalle paso a paso: el orden importa. Varias de las
+dependencias entre pasos no son obvias a primera vista (por ejemplo, no
+se puede restringir el acceso de la app a una capa que todavía no
+existe), así que conviene tener claro el grafo completo antes de
+empezar:
+
+```mermaid
+flowchart TD
+    A["5.1 Levantar Odoo + PostgreSQL"] --> E["5.4 Configurar y levantar<br/>integration-api"]
+    B["5.2 Publicar la Hosted<br/>Feature Layer"] --> C["5.2 Habilitar edición en la capa<br/>(Settings → Editing options)"]
+    B --> D["5.3 Registrar App Authentication<br/>(Client ID / Client Secret)"]
+    D --> D2["5.3 Volver luego y otorgar acceso<br/>a la capa ya publicada<br/>('Grant access to specific items')"]
+    C --> E
+    D2 --> E
+    A --> F["5.5 Crear datos de referencia en Odoo"]
+    E --> G["5.6 Activar sincronización automática"]
+    F --> G
+    G --> H["Verificar en ArcGIS:<br/>pestaña Data de la capa"]
+```
+
+Los bloques 5.1 (Odoo) y 5.2/5.3 (ArcGIS) son independientes entre sí y
+se pueden hacer en cualquier orden relativo — pero **dentro** del bloque
+de ArcGIS, publicar la capa siempre va antes de poder restringirle el
+acceso a la app.
+
 ### 5.1. Odoo y PostgreSQL
 
 ```bash
@@ -160,6 +185,10 @@ cp ../integration-api/.env.example .env
 python create_arcgis_feature_layer.py
 ```
 
+Este método ya solicita las capacidades de edición al crear el servicio
+(`capabilities: Create,Delete,Query,Update,Editing` en el script) — no
+requiere el paso adicional de habilitar edición manualmente.
+
 **Vía publicación manual** (obligatorio si tu cuenta de AGOL tiene MFA,
 o si el script anterior falla con error 500 por el Hosting Server de
 Enterprise):
@@ -175,6 +204,22 @@ Cualquiera de los dos métodos es compatible sin cambios de código: el
 nombre real del campo ObjectID (`OBJECTID` vs `objectid`, según el
 método) se detecta dinámicamente en tiempo de ejecución.
 
+**Habilitar edición en la capa (obligatorio si se publicó vía CSV):**
+
+Una capa publicada subiendo un CSV queda, por defecto, **sin edición
+habilitada** — el REST API rechaza cualquier `edit_features()` (tanto
+altas como actualizaciones) con `"This operation is not supported"`
+(Error Code 400), sin importar qué permisos tenga el usuario o la app
+que hace la llamada. Antes de continuar:
+
+1. Capa → **Settings**.
+2. Sección **Editing options** → activar **Enable editing**.
+3. Sección **Editing capabilities → What kind of editing is allowed?**
+   → activar al menos **Add** y **Update** (con **Attributes and
+   geometry**, no solo atributos, para que también se actualice la
+   posición del punto).
+4. **Save**.
+
 ### 5.3. Autenticación con ArcGIS — elegir según tu cuenta
 
 | Tu cuenta... | Usar |
@@ -188,49 +233,72 @@ método) se detecta dinámicamente en tiempo de ejecución.
 Requiere una cuenta con user type **Creator** o superior (si no aparece
 la opción **Developer credentials** al crear un ítem, esa es la causa).
 
-1. En el Portal/AGOL, con sesión iniciada → **Content → My Content →
-   New item**.
-2. Click **Developer credentials**.
-3. En la pantalla de tipo de credencial, selecciona **OAuth 2.0
-   credentials** → **Next**.
-4. En **Where will you use these credentials?**, selecciona **Private
-   application with selected privileges and access** — esta es la
-   variante server-to-server (sin redirect URL ni login interactivo, que
-   es lo que necesita el microservicio) → **Next**.
-5. En **Item access**, selecciona **Grant access to specific items** →
-   **Browse items** → marca la Hosted Feature Layer publicada en la
-   sección 5.2 → **Next**. Esto limita el alcance de la credencial a esa
-   capa puntual, en vez de darle acceso a todo el contenido de la
-   organización.
-6. En **Privileges**, dentro de la categoría **Features**, marca:
-   - **Edit with full control** (privilegio `features:user:fullEdit`) —
-     es el que necesita este proyecto: permite **crear, actualizar y
-     eliminar** features en una Hosted Feature Layer sin depender de las
-     opciones de edición configuradas manualmente en la capa. Lo usan
-     tanto `/sync/run` (Odoo → ArcGIS, crea y actualiza features) como
-     `/sync/reverse` (escribe de vuelta el `odoo_partner_id` en la
-     feature para marcarla como ya vinculada).
-   - Alternativa más restrictiva: **Edit** (`features:user:edit`) —
-     solo funciona si la capa ya tiene habilitadas manualmente las
-     opciones Create/Update/Delete en **Settings → Editing**. Si no
-     estás seguro, usa **Edit with full control**.
-   → **Next**.
-7. En **Referrer URLs**, déjalo en blanco → **Next**. Los referrers
-   restringen tokens usados desde un navegador; el microservicio llama
-   a la API desde el backend (server-to-server), no aplica.
-8. Completa **Title** (p. ej. `odoo-arcgis-integration-api`), **Folder**
-   (crea `Developer credentials` si no existe) y **Tags** → **Next** →
-   revisa el **Summary** → **Create**.
-9. En la página del ítem recién creado, baja hasta la sección
-   **Credentials** y copia **Client ID** y **Client Secret** → pégalos
-   en `integration-api/.env` como `ARCGIS_CLIENT_ID` y
-   `ARCGIS_CLIENT_SECRET`. El Client Secret solo se muestra completo la
-   primera vez; si lo pierdes, tenés que regenerarlo desde ahí mismo.
+```mermaid
+flowchart TD
+    A["Content → New Item →<br/>Developer credentials"] --> B["Select credential type:<br/>OAuth 2.0 credentials<br/>(For app authentication)"]
+    B --> C["Where will you use these credentials?<br/>Private application with<br/>selected privileges"]
+    C --> D{"¿La capa ya<br/>está publicada?"}
+    D -->|No todavía| E["Item access: No item access"]
+    D -->|Sí| F["Item access: Grant access<br/>to specific items → seleccionar la capa"]
+    E --> G["Privileges (Location services):<br/>apagar todo, incluido Basemaps"]
+    F --> G
+    G --> H["Referrer URLs: dejar vacío"]
+    H --> I["Item details: Title (obligatorio)"]
+    I --> J["Create → copiar<br/>Client ID y Client Secret"]
+    E -.->|"más tarde, ya con la capa publicada"| K["Credentials → Edit →<br/>Grant access to specific items"]
+```
 
-**Editar acceso o privilegios después de creada la credencial:** página
-del ítem → **Settings** → bajo **Application → Credentials** → **Edit**
-(aparece un aviso de confirmación → **Continue**) → repetís los pasos de
-**Item access** y **Privileges** de arriba.
+1. En el Portal/AGOL, con sesión iniciada → **Content → My Content →
+   New item → Developer credentials**.
+2. **Select credential type** → **OAuth 2.0 credentials** (la columna
+   del medio, "For app authentication" — no la de la izquierda, que es
+   para login interactivo de usuario, ni "API key credentials") →
+   **Next**.
+3. **Where will you use these credentials?** → **Private application
+   with selected privileges** (no "with all owner privileges" — esa da
+   acceso total a la organización, más de lo que necesita este
+   servicio) → **Next**.
+4. **Item access**:
+   - Si la Hosted Feature Layer **todavía no existe** (caso típico si
+     estás siguiendo esta guía en orden y aún no hiciste 5.2): selecciona
+     **No item access** por ahora — la lista de "specific items" estaría
+     vacía de todas formas. Retomas este paso más abajo.
+   - Si la capa **ya existe**: selecciona directamente **Grant access to
+     specific items** → **Browse items** → marca la capa → evita así
+     tener que volver después.
+   → **Next**.
+5. **Privileges**: esta pantalla lista privilegios de **servicios de
+   ubicación de Esri** (Basemaps, Geocoding, Routing, Data enrichment) —
+   APIs pagas que consumen créditos de tu organización. Este proyecto no
+   usa ninguna (`arcgis_client.py` solo llama a `query()` y
+   `edit_features()` sobre tu propia capa, no a esos servicios). **Apaga
+   todo**, incluido **Basemaps** (viene activado por defecto) → **Next**.
+6. **Referrer URLs**: dejar vacío → **Next**. Esta restricción aplica a
+   apps que corren en el navegador de un usuario (JavaScript
+   client-side); `integration-api` es un servicio backend que nunca
+   expone el `client_secret` a un navegador, así que no aplica.
+7. **Item details**: completa **Title** (único campo obligatorio, p. ej.
+   `integration-api-odoo`) → **Next** → revisa y confirma la creación.
+8. En la página del ítem recién creado → sección **Application →
+   Credentials**, copia **Client ID** y **Client Secret** → pégalos en
+   `integration-api/.env`. El Client Secret solo se muestra completo la
+   primera vez.
+
+**Si en el paso 4 elegiste "No item access"** (porque la capa aún no
+existía), vuelve una vez publicada (sección 5.2):
+
+- Página de estas credenciales → **Application → Credentials → Edit** →
+  ahora sí selecciona **Grant access to specific items** → **Browse
+  items** → marca la capa → **Save**.
+
+**Importante — qué autoriza realmente la edición:** el acceso otorgado
+aquí (`Grant access to specific items`) determina **a qué ítems** puede
+llegar la app; **no** reemplaza la configuración de edición de la propia
+capa. Ambas cosas son necesarias: item access aquí, y **Enable editing**
++ **Add/Update** en la capa (sección 5.2) — si falta cualquiera de las
+dos, `/sync/run` falla (con `403` si falta el item access, con `400
+"This operation is not supported"` si falta la edición habilitada en la
+capa).
 
 > En ArcGIS Enterprise el flujo es idéntico; solo cambia que accedés
 > desde la URL del Portal (Web Adaptor) en vez de `arcgis.com`, y el
@@ -257,7 +325,9 @@ docker compose logs -f integration-api
 Verificación: `http://localhost:8000/health` → `{"status": "ok"}`.
 Documentación interactiva (Swagger): `http://localhost:8000/docs`.
 
-### 5.5. Datos de referencia en Odoo
+### 5.5. Datos en Odoo
+
+**Opción A — script (rápido, para poblar de una vez):**
 
 ```bash
 cd scripts
@@ -266,6 +336,28 @@ python seed_odoo_demo_data.py
 
 Crea 8 solicitudes de ejemplo (proyecto + tareas + contactos vinculados)
 con coordenadas de referencia en Quito.
+
+**Opción B — manual vía interfaz (útil para demostrar el flujo en vivo
+durante una presentación):**
+
+1. Odoo → **Project** → abre (o crea) el proyecto configurado en
+   `ODOO_PROJECT_NAME` (por defecto, `Solicitudes Ciudadanas`).
+2. **New** → nombra la tarea con la descripción de la solicitud.
+3. En el campo **Customer** (o "Cliente"/"Contacto", según la
+   configuración de Project) selecciona un contacto existente, o crea
+   uno nuevo con **Create and edit** para poder completar su dirección.
+4. El contacto necesita coordenadas para que la solicitud llegue a
+   ArcGIS: en la ficha del contacto (Odoo → Contacts → abrir el
+   contacto), si no ves campos de latitud/longitud visibles en el
+   formulario estándar, se pueden completar vía **Settings → Technical
+   → Database Structure → (o directamente por XML-RPC)** — en la
+   práctica, para una demo en vivo suele ser más simple partir de un
+   contacto ya creado por el script de la Opción A (que sí trae
+   coordenadas) y solo crear la **tarea** nueva a mano, vinculándola a
+   ese contacto existente.
+5. Guarda la tarea. Si la sincronización automática está activa
+   (sección 5.6), aparece en ArcGIS dentro del intervalo configurado;
+   si no, dispara `POST /sync/run` manualmente (sección 5.7).
 
 ### 5.6. Sincronización automática (recomendado)
 
@@ -427,7 +519,9 @@ por configuración (`ARCGIS_URL`, credenciales, `ARCGIS_VERIFY_CERT`).
 - `ARCGIS_CLIENT_SECRET` es tan sensible como una contraseña — mismo
   trato que `ARCGIS_PASSWORD`.
 - App Authentication con acceso restringido al ítem específico (sección
-  5.3, paso 4) en vez de acceso a toda la organización.
+  5.3) en vez de acceso a toda la organización, y con los privilegios de
+  servicios de ubicación (Basemaps, Geocoding, Routing, Data enrichment)
+  desactivados si no se usan.
 - `ARCGIS_VERIFY_CERT=False` solo en redes de laboratorio controladas —
   expone a MITM si el tráfico sale de esa red.
 - `admin_passwd` de `odoo.conf`: cambiar el valor por defecto, y no
@@ -447,9 +541,11 @@ por configuración (`ARCGIS_URL`, credenciales, `ARCGIS_VERIFY_CERT`).
 | `NameResolutionError` hacia Enterprise, pero resuelve desde el host | Hostname `.local` resuelto vía mDNS/LLMNR de Windows, no por Docker | `extra_hosts: ["host:host-gateway"]` en `docker-compose.yml` |
 | `SSLCertVerificationError: self-signed certificate` | Certificado autofirmado de Enterprise | `ARCGIS_VERIFY_CERT=False` (solo lab) |
 | `"El nombre de campo \"OBJECTID\" no existe"` | Varía según método de publicación | Ya resuelto: se detecta dinámicamente |
+| `"This operation is not supported"` (Error Code 400) al hacer `/sync/run` | La capa quedó con edición desactivada — frecuente al publicar desde CSV, incluso teniendo el usuario/app permisos de por sí | Capa → Settings → Editing options → activar **Enable editing** + **Add/Update** (sección 5.2) |
 | `/sync/reverse` no crea nada aunque hay features nuevas | Change Tracking no es requisito para esto (usa `IS NULL`, no tracking) — revisar que la feature realmente no tenga `odoo_partner_id` | Confirmar en la tabla **Data** de la capa |
 | Botón "Create webhook" deshabilitado en la capa | Requiere **Change Tracking** activado primero (capa → Settings → Editing) | Activarlo y guardar; si falla el guardado, revisar log del Portal Admin |
 | Cambio de etapa vía `/webhook/arcgis` no mueve la tarea | `new_status` no coincide exactamente con el nombre de una etapa en Odoo | Verificar nombres en Project → Configuration → Stages |
+| Odoo entra en bucle de `password authentication failed` para el usuario de PostgreSQL, sin haber tocado la configuración | El volumen `odoo-db-data` es persistente y conserva la contraseña con la que se inicializó la primera vez; si el `.env` de la raíz falta o cambió, los valores por defecto de `docker-compose.yml` ya no coinciden con lo que Postgres tiene guardado | Recrear el `.env` de la raíz con la contraseña original y `docker compose up -d --force-recreate db odoo`; si no se puede reconstruir esa contraseña, eliminar el volumen (`docker volume rm <proyecto>_odoo-db-data`) y recrear la base — implica perder los datos existentes de Odoo |
 
 Diagnóstico general:
 
