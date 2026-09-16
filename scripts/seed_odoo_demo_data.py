@@ -1,9 +1,13 @@
 """
-Crea datos demo en Odoo: un proyecto "Solicitudes Ciudadanas" con una
-tarea (project.task) por cada solicitud, vinculada a un contacto
+Crea datos demo en Odoo: un proyecto (ODOO_PROJECT_NAME) con una tarea
+(project.task) por cada solicitud ciudadana, vinculada a un contacto
 (res.partner) que representa al ciudadano y lleva la geolocalización.
 
 Requiere el módulo Project activado en Odoo (Apps -> Project -> Activate).
+
+Uso:
+    pip install -r requirements.txt
+    python seed_odoo_demo_data.py
 """
 
 import os
@@ -18,6 +22,8 @@ ODOO_USERNAME = os.getenv("ODOO_USERNAME", "admin")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD", "admin")
 PROJECT_NAME = os.getenv("ODOO_PROJECT_NAME", "Solicitudes Ciudadanas")
 
+# Puntos de ejemplo dentro de una ciudad (ajustar a tu municipio real).
+# Por defecto: referencias dentro de Quito, Ecuador.
 DEMO_REQUESTS = [
     {"citizen": "Juan Pérez", "issue": "Bache en vía - La Mariscal",
      "street": "Av. Amazonas y Roca", "city": "Quito",
@@ -58,10 +64,9 @@ def main() -> None:
         return models.execute_kw(ODOO_DB, uid, ODOO_PASSWORD, model, method, list(args))
 
     project_ids = execute("project.project", "search", [["name", "=", PROJECT_NAME]])
-    if project_ids:
-        project_id = project_ids[0]
-    else:
-        project_id = execute("project.project", "create", {"name": PROJECT_NAME})
+    project_id = project_ids[0] if project_ids else execute(
+        "project.project", "create", {"name": PROJECT_NAME}
+    )
     print(f"Proyecto '{PROJECT_NAME}' -> id {project_id}")
 
     created = 0

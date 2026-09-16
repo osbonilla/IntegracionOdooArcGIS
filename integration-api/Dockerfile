@@ -2,7 +2,6 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Dependencias de sistema requeridas por el paquete "arcgis" (ArcGIS API for Python)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \

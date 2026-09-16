@@ -1,2 +1,2 @@
 python-dotenv==1.0.1
-arcgis==2.3.1
+arcgis==2.4.3

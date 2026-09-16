@@ -1,7 +1,8 @@
 """
 Cliente ArcGIS usando "ArcGIS API for Python" (paquete `arcgis`).
-Funciona igual para ArcGIS Online y ArcGIS Enterprise; solo cambia la
-URL de conexión (ARCGIS_URL en .env).
+Funciona igual para ArcGIS Online y ArcGIS Enterprise: lo único que
+cambia es ARCGIS_URL y, según la cuenta, el método de autenticación
+(ver connect()).
 """
 
 import logging
@@ -15,10 +16,10 @@ from app.config import settings
 logger = logging.getLogger("integration.arcgis")
 
 # Nombre del campo en la Feature Layer que guarda el identificador único
-# del registro de origen en Odoo. Se conserva el nombre histórico
-# `odoo_partner_id` por compatibilidad con la capa ya publicada durante
-# las pruebas previas (cuando el origen era res.partner); a partir de
-# esta versión el valor que contiene es el ID de la tarea (project.task).
+# del registro de origen en Odoo (el id de la tarea project.task). Se
+# conserva el nombre histórico `odoo_partner_id` por compatibilidad con
+# capas publicadas en iteraciones previas de este proyecto (cuando el
+# origen era res.partner).
 ODOO_ID_FIELD = "odoo_partner_id"
 
 
@@ -30,17 +31,35 @@ class ArcGISClient:
 
     def connect(self) -> GIS:
         if self._gis is None:
-            self._gis = GIS(
-                settings.arcgis_url,
-                settings.arcgis_username,
-                settings.arcgis_password,
-                verify_cert=settings.arcgis_verify_cert,
-            )
-            logger.info(
-                "Conectado a ArcGIS como %s (%s)",
-                self._gis.users.me.username,
-                settings.arcgis_url,
-            )
+            if settings.arcgis_client_id and settings.arcgis_client_secret:
+                # App Authentication (OAuth 2.0 client credentials): la
+                # aplicación se autentica a sí misma, no un usuario -> no
+                # se ve afectada por MFA. Recomendado para servicios
+                # desatendidos como este. Requiere que las credenciales
+                # OAuth tengan acceso concedido al item de la capa
+                # (ver README sección 5.3).
+                self._gis = GIS(
+                    settings.arcgis_url,
+                    client_id=settings.arcgis_client_id,
+                    client_secret=settings.arcgis_client_secret,
+                    verify_cert=settings.arcgis_verify_cert,
+                )
+                logger.info(
+                    "Conectado a ArcGIS vía App Authentication (%s)",
+                    settings.arcgis_url,
+                )
+            else:
+                self._gis = GIS(
+                    settings.arcgis_url,
+                    settings.arcgis_username,
+                    settings.arcgis_password,
+                    verify_cert=settings.arcgis_verify_cert,
+                )
+                logger.info(
+                    "Conectado a ArcGIS como %s (%s)",
+                    self._gis.users.me.username,
+                    settings.arcgis_url,
+                )
         return self._gis
 
     def get_layer(self) -> FeatureLayer:
@@ -49,7 +68,8 @@ class ArcGISClient:
 
         if not settings.arcgis_feature_layer_item_id:
             raise RuntimeError(
-                "ARCGIS_FEATURE_LAYER_ITEM_ID no está configurado."
+                "ARCGIS_FEATURE_LAYER_ITEM_ID no está configurado. Ver README "
+                "sección 5.2 para crear/publicar la capa."
             )
 
         gis = self.connect()
@@ -62,6 +82,11 @@ class ArcGISClient:
         return self._layer
 
     def _oid_field(self) -> str:
+        """
+        Nombre real del campo ObjectID de la capa. Varía según cómo se
+        publicó (CSV -> típicamente 'objectid'; create_service() vía
+        script -> 'OBJECTID') — nunca se asume un nombre fijo.
+        """
         layer = self.get_layer()
         return layer.properties.objectIdField
 
@@ -106,6 +131,8 @@ class ArcGISClient:
             "email": record.get("email") or "",
             "status": record.get("stage") or "",
         }
+        # Solo se completan si existen en el esquema real de la capa -
+        # evita asumir un esquema fijo (ver README sección 9).
         if "latitude" in field_names:
             attributes["latitude"] = lat
         if "longitude" in field_names:
@@ -131,3 +158,31 @@ class ArcGISClient:
             if not ok:
                 raise RuntimeError(f"Error creando feature: {result}")
             return "created"
+
+    def get_unlinked_features(self) -> list[dict]:
+        """
+        Features sin odoo_partner_id: creadas directo en la capa (edición
+        manual) o vía un formulario Survey123 apuntado a esta misma capa.
+        Son las candidatas a convertirse en tareas nuevas en Odoo.
+        """
+        layer = self.get_layer()
+        result = layer.query(where=f"{ODOO_ID_FIELD} IS NULL")
+        features = []
+        for f in result.features:
+            attrs = dict(f.attributes)
+            attrs["_oid"] = attrs[self._oid_field()]
+            attrs["_lat"] = f.geometry["y"] if f.geometry else None
+            attrs["_lon"] = f.geometry["x"] if f.geometry else None
+            features.append(attrs)
+        return features
+
+    def set_odoo_id(self, object_id: int, odoo_task_id: int) -> None:
+        """
+        Escribe de vuelta el task_id de Odoo en la feature, inmediatamente
+        después de crear la tarea correspondiente (write-back). Sin esto,
+        la misma feature se reprocesaría como "nueva" en cada corrida.
+        """
+        layer = self.get_layer()
+        layer.edit_features(updates=[{
+            "attributes": {self._oid_field(): object_id, ODOO_ID_FIELD: odoo_task_id}
+        }])

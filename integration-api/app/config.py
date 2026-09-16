@@ -11,10 +11,12 @@ class Settings(BaseSettings):
 
     # ArcGIS
     arcgis_url: str = "https://www.arcgis.com"
+    arcgis_verify_cert: bool = True
     arcgis_username: str = ""
     arcgis_password: str = ""
+    arcgis_client_id: str = ""
+    arcgis_client_secret: str = ""
     arcgis_feature_layer_item_id: str = ""
-    arcgis_verify_cert: bool = True
 
     # Sync
     sync_interval_minutes: int = 0
