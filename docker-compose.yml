@@ -11,7 +11,7 @@ services:
     volumes:
       - odoo-db-data:/var/lib/postgresql/data/pgdata
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${ODOO_DB_USER:-odoo}"]
+      test: ["CMD-SHELL", "pg_isready -U ${ODOO_DB_USER:-odoo} -d postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
