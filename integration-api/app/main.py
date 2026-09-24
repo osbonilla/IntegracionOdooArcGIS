@@ -4,7 +4,9 @@ from fastapi import FastAPI, HTTPException
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.config import settings
-from app.schemas import SyncSummary, ReverseSyncSummary, ArcGISWebhookPayload
+from app.schemas import (
+    SyncSummary, ReverseSyncSummary, ReconciliationSummary, ArcGISWebhookPayload,
+)
 from app import sync
 
 logging.basicConfig(level=logging.INFO)
@@ -17,9 +19,10 @@ app = FastAPI(
         "(project.task + res.partner) de Odoo hacia una Hosted Feature "
         "Layer en ArcGIS Online / Enterprise, y procesa actualizaciones "
         "en sentido inverso: features nuevas (p. ej. desde Survey123) y "
-        "cambios de estado."
+        "cambios de estado. Incluye una pasada de reconciliación que "
+        "borra en ArcGIS las features cuya tarea de Odoo ya no existe."
     ),
-    version="2.0.0",
+    version="2.1.0",
 )
 
 scheduler = BackgroundScheduler()
@@ -36,9 +39,14 @@ def startup() -> None:
             sync.run_reverse_sync, "interval",
             minutes=settings.sync_interval_minutes, id="periodic_reverse_sync",
         )
+        scheduler.add_job(
+            sync.run_reconciliation, "interval",
+            minutes=settings.sync_interval_minutes, id="periodic_reconciliation",
+        )
         scheduler.start()
         logger.info(
-            "Sincronización automática (ambas direcciones) activada cada %s minutos",
+            "Sincronización automática (ambas direcciones + reconciliación) "
+            "activada cada %s minutos",
             settings.sync_interval_minutes,
         )
     else:
@@ -84,6 +92,26 @@ def trigger_reverse_sync() -> ReverseSyncSummary:
 @app.get("/sync/reverse/last", response_model=ReverseSyncSummary | None)
 def last_reverse_sync() -> ReverseSyncSummary | None:
     return sync.get_last_reverse_summary()
+
+
+@app.post("/sync/reconcile", response_model=ReconciliationSummary)
+def trigger_reconciliation() -> ReconciliationSummary:
+    """
+    Fuerza una pasada de reconciliación bajo demanda: borra en ArcGIS
+    las features cuyo odoo_partner_id ya no corresponde a ninguna tarea
+    existente en Odoo (por ejemplo, tras borrar manualmente una tarea
+    de prueba duplicada).
+    """
+    try:
+        return sync.run_reconciliation()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Fallo la reconciliación ArcGIS <-> Odoo")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/sync/reconcile/last", response_model=ReconciliationSummary | None)
+def last_reconciliation() -> ReconciliationSummary | None:
+    return sync.get_last_reconciliation_summary()
 
 
 @app.post("/webhook/arcgis")

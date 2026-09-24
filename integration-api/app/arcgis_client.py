@@ -22,6 +22,13 @@ logger = logging.getLogger("integration.arcgis")
 # origen era res.partner).
 ODOO_ID_FIELD = "odoo_partner_id"
 
+# Valor centinela usado para "reclamar" una feature antes de crear la
+# tarea correspondiente en Odoo (ver claim_feature). Ningún project.task
+# real va a tener nunca id=-1 en Odoo (los ids son autoincrementales
+# positivos), así que es seguro usarlo como marca de "procesando" sin
+# confundirse con un odoo_partner_id real.
+CLAIM_SENTINEL = -1
+
 
 class ArcGISClient:
     def __init__(self) -> None:
@@ -137,6 +144,8 @@ class ArcGISClient:
             attributes["latitude"] = lat
         if "longitude" in field_names:
             attributes["longitude"] = lon
+        if "citizen_name" in field_names:
+            attributes["citizen_name"] = record.get("citizen_name") or ""
 
         geometry = {"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}
 
@@ -163,10 +172,21 @@ class ArcGISClient:
         """
         Features sin odoo_partner_id: creadas directo en la capa (edición
         manual) o vía un formulario Survey123 apuntado a esta misma capa.
-        Son las candidatas a convertirse en tareas nuevas en Odoo.
+        Son las candidatas a convertirse en tareas nuevas en Odoo. No
+        incluye las que tienen el centinela de claim (CLAIM_SENTINEL):
+        esas ya están siendo procesadas por otra corrida.
+
+        out_sr=4326 fuerza a que la geometría vuelva en grados WGS84,
+        sin importar la referencia espacial de almacenamiento nativa de
+        la capa (la mayoría de las Hosted Feature Layers de AGOL
+        guardan internamente en Web Mercator/3857, aunque se vea todo
+        en grados en el mapa). Sin esto, f.geometry["x"]/["y"] venían
+        en metros Web Mercator, no en grados -- por eso las coordenadas
+        quedaban con valores absurdos (decenas de miles / millones) al
+        crear la tarea en Odoo desde una feature de Survey123.
         """
         layer = self.get_layer()
-        result = layer.query(where=f"{ODOO_ID_FIELD} IS NULL")
+        result = layer.query(where=f"{ODOO_ID_FIELD} IS NULL", out_sr=4326)
         features = []
         for f in result.features:
             attrs = dict(f.attributes)
@@ -178,11 +198,92 @@ class ArcGISClient:
 
     def set_odoo_id(self, object_id: int, odoo_task_id: int) -> None:
         """
-        Escribe de vuelta el task_id de Odoo en la feature, inmediatamente
-        después de crear la tarea correspondiente (write-back). Sin esto,
-        la misma feature se reprocesaría como "nueva" en cada corrida.
+        Escribe de vuelta el task_id de Odoo en la feature. Se mantiene
+        por compatibilidad, pero el flujo de reverse-sync usa
+        link_new_feature() en su lugar, que además fija el status
+        inicial en la misma llamada.
         """
         layer = self.get_layer()
         layer.edit_features(updates=[{
             "attributes": {self._oid_field(): object_id, ODOO_ID_FIELD: odoo_task_id}
         }])
+
+    def link_new_feature(self, object_id: int, odoo_task_id: int, status_label: str) -> None:
+        """
+        Cierra el ciclo de una feature nueva (creada por Survey123 o
+        edición manual): escribe en UNA sola llamada el odoo_partner_id
+        (vínculo) Y el status inicial de la tarea recién creada en Odoo.
+        Reemplaza a set_odoo_id() en el flujo de reverse-sync -- con
+        solo set_odoo_id() el status quedaba vacío hasta el próximo
+        ciclo del sync hacia adelante (Odoo -> ArcGIS).
+        """
+        layer = self.get_layer()
+        attributes: dict[str, Any] = {
+            self._oid_field(): object_id,
+            ODOO_ID_FIELD: odoo_task_id,
+        }
+        if "status" in self._layer_field_names():
+            attributes["status"] = status_label
+        layer.edit_features(updates=[{"attributes": attributes}])
+
+    def claim_feature(self, object_id: int) -> bool:
+        """
+        Reclama una feature ANTES de crear la tarea en Odoo, escribiendo
+        el valor centinela en odoo_partner_id. Esto es lo que hace
+        idempotente al reverse-sync: si dos corridas se solapan (el
+        scheduler y un curl manual al mismo tiempo, por ejemplo), la
+        segunda ya no va a ver esta feature en get_unlinked_features()
+        (que filtra por odoo_partner_id IS NULL) porque ya dejó de ser
+        NULL -- sin este paso, ambas corridas podrían crear una tarea
+        duplicada en Odoo para la misma feature.
+        """
+        layer = self.get_layer()
+        result = layer.edit_features(updates=[{
+            "attributes": {self._oid_field(): object_id, ODOO_ID_FIELD: CLAIM_SENTINEL}
+        }])
+        return result["updateResults"][0]["success"]
+
+    def release_claim(self, object_id: int) -> None:
+        """
+        Revierte un claim si la creación en Odoo falló después de
+        reclamar la feature -- la deja de nuevo en NULL para que la
+        próxima corrida la vuelva a intentar, en vez de quedar huérfana
+        con el centinela para siempre.
+        """
+        layer = self.get_layer()
+        layer.edit_features(updates=[{
+            "attributes": {self._oid_field(): object_id, ODOO_ID_FIELD: None}
+        }])
+
+    def get_linked_features(self) -> list[dict]:
+        """
+        Features CON odoo_partner_id asignado (excluyendo el centinela
+        de claim, que representa un procesamiento en curso, no un
+        vínculo real todavía). Se usa en la reconciliación: por cada
+        una se verifica si esa tarea sigue existiendo en Odoo.
+        """
+        layer = self.get_layer()
+        oid_field = self._oid_field()
+        result = layer.query(
+            where=f"{ODOO_ID_FIELD} IS NOT NULL AND {ODOO_ID_FIELD} <> {CLAIM_SENTINEL}",
+            out_fields=[oid_field, ODOO_ID_FIELD],
+            return_geometry=False,
+        )
+        return [
+            {"_oid": f.attributes[oid_field], "task_id": f.attributes[ODOO_ID_FIELD]}
+            for f in result.features
+        ]
+
+    def delete_features(self, object_ids: list[int]) -> int:
+        """
+        Borra features por ObjectID. Se usa en la reconciliación para
+        eliminar de la capa las features cuya tarea de Odoo ya no existe
+        (fue borrada directamente en Odoo) -- lo que hay en Odoo manda;
+        ArcGIS debe reflejar ese mismo conjunto, sin huérfanos. Devuelve
+        cuántas se borraron con éxito.
+        """
+        if not object_ids:
+            return 0
+        layer = self.get_layer()
+        result = layer.edit_features(deletes=object_ids)
+        return sum(1 for r in result.get("deleteResults", []) if r.get("success"))

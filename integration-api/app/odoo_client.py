@@ -5,6 +5,12 @@ Modelo de datos: cada solicitud ciudadana es una tarea (`project.task`)
 dentro del proyecto ODOO_PROJECT_NAME, vinculada a un contacto
 (`res.partner`) que representa al ciudadano y lleva la geolocalización
 (`partner_latitude` / `partner_longitude`, del módulo `base_geolocalize`).
+
+El estado de la solicitud se lee del campo `state` (Selection) de
+project.task -- NO de `stage_id` (que es el modelo de columnas Kanban,
+un concepto distinto en Odoo). `state` devuelve un código interno
+(ej. "01_in_progress"), no la etiqueta visible ("In Progress"), por eso
+se resuelve dinámicamente vía fields_get en vez de asumir un mapeo fijo.
 """
 
 import logging
@@ -23,6 +29,7 @@ class OdooClient:
         self.username = settings.odoo_username
         self.password = settings.odoo_password
         self._uid: int | None = None
+        self._state_label_map: dict[str, str] | None = None
 
     def _common(self):
         return xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/common")
@@ -69,13 +76,25 @@ class OdooClient:
             return project_ids[0]
         return self._execute("project.project", "create", {"name": project_name})
 
+    def _get_state_label_map(self) -> dict[str, str]:
+        """
+        Mapeo {código interno: etiqueta} del campo Selection `state` de
+        project.task, leído dinámicamente vía fields_get -- no hardcodeado,
+        para no asumir un esquema fijo si el proyecto personaliza los
+        valores (ej. "01_in_progress" -> "In Progress").
+        """
+        if self._state_label_map is None:
+            info = self._execute("project.task", "fields_get", ["state"], ["selection"])
+            self._state_label_map = dict(info["state"]["selection"])
+        return self._state_label_map
+
     def get_project_tasks(self, project_name: str) -> list[dict]:
         """
         Trae las tareas (project.task) del proyecto `project_name`, junto
-        con los datos de geolocalización del contacto (res.partner)
-        vinculado a cada una. Requiere dos consultas porque la External
-        API de Odoo no resuelve campos de relaciones anidadas
-        (partner_id.partner_latitude) en una sola llamada.
+        con los datos del contacto (res.partner) vinculado a cada una:
+        nombre del ciudadano y geolocalización. Requiere dos consultas
+        porque la External API de Odoo no resuelve campos de relaciones
+        anidadas (partner_id.partner_latitude) en una sola llamada.
         """
         project_ids = self._execute(
             "project.project", "search", [["name", "=", project_name]]
@@ -84,7 +103,9 @@ class OdooClient:
             logger.warning("No existe el proyecto '%s' en Odoo todavía.", project_name)
             return []
 
-        task_fields = ["id", "name", "partner_id", "stage_id", "write_date"]
+        label_map = self._get_state_label_map()
+
+        task_fields = ["id", "name", "partner_id", "state", "write_date"]
         tasks = self._execute(
             "project.task", "search_read",
             [["project_id", "in", project_ids]], task_fields
@@ -96,7 +117,7 @@ class OdooClient:
         partners_by_id: dict[int, dict] = {}
         if partner_ids:
             partner_fields = [
-                "id", "street", "city", "phone", "email",
+                "id", "name", "street", "city", "phone", "email",
                 "partner_latitude", "partner_longitude",
             ]
             partners = self._execute(
@@ -110,7 +131,8 @@ class OdooClient:
             results.append({
                 "task_id": task["id"],
                 "description": task["name"],
-                "stage": task["stage_id"][1] if task.get("stage_id") else "",
+                "stage": label_map.get(task.get("state"), task.get("state") or ""),
+                "citizen_name": partner.get("name") or "",
                 "street": partner.get("street") or "",
                 "city": partner.get("city") or "",
                 "phone": partner.get("phone") or "",
@@ -125,32 +147,40 @@ class OdooClient:
         self._execute("project.task", "message_post", task_id, body=body)
         logger.info("Nota registrada en project.task id=%s", task_id)
 
-    def set_task_stage_by_name(self, task_id: int, stage_name: str) -> bool:
+    def set_task_state_by_label(self, task_id: int, label: str) -> bool:
         """
-        Mueve la tarea a la etapa (project.task.type) cuyo nombre coincide
-        con `stage_name`. Devuelve False si no existe esa etapa (en cuyo
-        caso el llamador debe decidir si igual registrar el cambio como
-        nota, ver sync.handle_arcgis_status_webhook).
+        Mueve la tarea al estado (campo `state`) cuya etiqueta coincide
+        con `label` (ej. "Approved", "Done"). Devuelve False si no existe
+        esa etiqueta (en cuyo caso el llamador debe decidir si igual
+        registrar el cambio como nota, ver sync.handle_arcgis_status_webhook).
         """
-        stage_ids = self._execute("project.task.type", "search", [["name", "=", stage_name]])
-        if not stage_ids:
+        label_map = self._get_state_label_map()
+        code = next((k for k, v in label_map.items() if v == label), None)
+        if code is None:
             return False
-        self._execute("project.task", "write", [task_id], {"stage_id": stage_ids[0]})
+        self._execute("project.task", "write", [task_id], {"state": code})
         return True
 
     def create_task_from_arcgis(self, record: dict, project_name: str) -> int:
         """
         Crea contacto + tarea en Odoo a partir de una feature nueva sin
         vincular (típicamente proveniente de Survey123 o de una edición
-        manual en ArcGIS). `record` trae _lat/_lon además de los campos
-        de negocio (name, address, city, phone, email).
+        manual en ArcGIS). El nombre del CONTACTO se toma de
+        `citizen_name` (lo que el ciudadano escribió en "Tu nombre
+        completo" en el formulario) -- `name` es la descripción del
+        problema, no el nombre de la persona, y no debe usarse para el
+        contacto. `record` trae _lat/_lon (de la geometría) además de
+        los campos de negocio (citizen_name, name, address, city,
+        phone, email).
         """
         project_id = self.get_or_create_project(project_name)
+        citizen_name = record.get("citizen_name") or "Ciudadano (Survey123)"
         partner_id = self._execute("res.partner", "create", {
-            "name": record.get("name") or "Reporte vía ArcGIS",
+            "name": citizen_name,
             "street": record.get("address") or "",
             "city": record.get("city") or "",
             "phone": record.get("phone") or "",
+            "email": record.get("email") or "",
             "partner_latitude": record.get("_lat"),
             "partner_longitude": record.get("_lon"),
         })
@@ -160,3 +190,34 @@ class OdooClient:
             "partner_id": partner_id,
         })
         return task_id
+
+    def get_task_state_label(self, task_id: int) -> str:
+        """
+        Lee el estado (`state`) actual de una tarea y lo resuelve a su
+        etiqueta visible. Se usa justo después de create_task_from_arcgis
+        para poder escribir el status inicial de vuelta en ArcGIS en la
+        MISMA pasada del reverse-sync, en vez de dejarlo en blanco hasta
+        el próximo ciclo del sync hacia adelante (Odoo -> ArcGIS) -- sin
+        esto, una feature nueva creada por Survey123 aparecía en el mapa
+        pero con el status vacío hasta que corriera ese segundo ciclo.
+        """
+        label_map = self._get_state_label_map()
+        task = self._execute("project.task", "read", [task_id], ["state"])
+        code = task[0]["state"] if task else None
+        return label_map.get(code, code or "")
+
+    def filter_existing_task_ids(self, task_ids: list[int]) -> set[int]:
+        """
+        De una lista de ids de project.task, devuelve el subconjunto que
+        SÍ existe todavía en Odoo. Se usa en la reconciliación para
+        detectar referencias huérfanas en ArcGIS: features cuyo
+        odoo_partner_id apunta a una tarea que ya fue borrada
+        directamente en Odoo (por ejemplo, al limpiar un registro de
+        prueba duplicado).
+        """
+        if not task_ids:
+            return set()
+        existing = self._execute(
+            "project.task", "search", [["id", "in", list(task_ids)]]
+        )
+        return set(existing)
