@@ -1,1454 +1,609 @@
-# Integración Odoo ↔ ArcGIS Online / Enterprise — flujo end-to-end (E2E)
+# Integración Odoo ↔ ArcGIS Online / Enterprise
 
-Este proyecto muestra una integración entre **Odoo** y **ArcGIS Online / ArcGIS Enterprise** mediante un microservicio encargado de sincronizar información en ambos sentidos.
+Demo técnica de integración bidireccional entre **Odoo** (gestión de
+solicitudes ciudadanas) y **ArcGIS Online / Enterprise** (visualización
+geoespacial + captura de datos de campo con **Survey123**), a través de un
+microservicio propio en **FastAPI**.
 
-El flujo incorpora también **Survey123** para captura de información en campo y **Dashboard / Experience Builder** para consultar y visualizar los datos desde una misma fuente.
-
-El caso de uso utilizado como referencia corresponde a la gestión de **solicitudes ciudadanas** dentro de un entorno municipal.
-
----
-
-## 1. Caso de uso
-
-Cada solicitud ciudadana se registra en Odoo como un `project.task`. La tarea se relaciona con un contacto (`res.partner`) que representa al ciudadano que realizó la solicitud.
-
-El contacto puede almacenar, además de sus datos básicos, las coordenadas geográficas de su ubicación mediante los campos `partner_latitude` y `partner_longitude`, proporcionados por `base_geolocalize`.
-
-### 1.1 Modelo de datos
-
-La información del ciudadano y la solicitud se mantiene separada porque cumplen funciones diferentes dentro de Odoo:
-
-- `res.partner`: representa al ciudadano y contiene información como nombre, dirección, teléfono y coordenadas.
-- `project.task`: representa la solicitud y contiene su descripción, estado y relación con el ciudadano mediante `partner_id`.
-
-De esta forma, una persona puede tener varias solicitudes a lo largo del tiempo sin duplicar su información de contacto.
-
-El ejemplo utiliza el módulo **Project** disponible en Odoo Community. Para activarlo:
-
-**Apps → Project → Activate**
-
-No es necesario utilizar módulos de pago ni desarrollar módulos personalizados para reproducir el flujo descrito en este proyecto.
-
-Para un escenario productivo, sería recomendable implementar un modelo de negocio específico que permita manejar aspectos como SLA, archivos adjuntos, responsables y asignación de cuadrillas. Esta alternativa se comenta en la sección [11. Consideraciones para producción](#11-consideraciones-para-producción).
-
----
-
-## 2. Arquitectura del flujo
-
-La integración utiliza un microservicio intermedio para mantener sincronizados Odoo y ArcGIS.
+## Arquitectura
 
 ```mermaid
-flowchart TD
-    subgraph ODOO["Odoo"]
-        TASK["project.task + res.partner"]
-        AUTO["Automation Rule<br/>(push inmediato, opcional)"]
+flowchart RL
+    operador(["Operador municipal"])
+    ciudadano(["Ciudadano"])
+
+    subgraph ODOO["Odoo · Docker"]
+        direction TB
+        task["project.task<br/>solicitud + state"]
+        partner["res.partner<br/>ciudadano + lat/lon"]
+        rule{{"Automation Rule<br/>On Update · campo state"}}
+        task --- partner
+        task -. "cambio de state" .-> rule
     end
 
-    subgraph API["Integration API"]
-        SYNCFWD["POST /sync/run<br/>+ polling automático"]
-        SYNCREV["POST /sync/reverse<br/>+ polling automático"]
-        WHARCGIS["POST /webhook/arcgis"]
-        WHODOO["POST /webhook/odoo"]
+    subgraph API["integration-api · FastAPI + Docker"]
+        direction TB
+        endpoints["Endpoints REST<br/>/webhook/odoo<br/>/webhook/arcgis<br/>/sync/run · /sync/reverse<br/>/sync/reconcile"]
+        sched(["APScheduler<br/>cada N minutos<br/>SYNC_INTERVAL_MINUTES"])
+        sync["sync.py<br/>run_sync<br/>run_reverse_sync<br/>run_reconciliation"]
+        clients["odoo_client.py<br/>arcgis_client.py"]
+        endpoints --> sync
+        sched --> sync
+        sync --> clients
     end
 
-    subgraph ARCGIS["ArcGIS Online / Enterprise"]
-        LAYER[("Hosted Feature Layer")]
-        SURVEY["Survey123<br/>(captura en campo)"]
-        DASH["Dashboard / Experience Builder"]
+    subgraph ESRI["ArcGIS Online / Enterprise"]
+        direction TB
+        s123["Survey123<br/>formulario de campo"]
+        layer[("Hosted Feature Layer<br/>odoo_partner_id = task.id")]
+        s123 -- "escribe directo<br/>(no pasa por la API)" --> layer
     end
 
-    TASK -->|lee vía XML-RPC| SYNCFWD
-    SYNCFWD -->|crea/actualiza| LAYER
+    operador -- "cambia el estado" --> ODOO
+    ODOO == "Automation Rule<br/>POST /webhook/odoo<br/>(push instantáneo)" ==> API
+    API -- "XML-RPC<br/>lee y escribe tareas/contactos" --> ODOO
+    API -- "ArcGIS API for Python<br/>query · edit_features · out_sr=4326" --> ESRI
+    ESRI -. "POST /webhook/arcgis<br/>(hoy: simulado con curl)" .-> API
+    ciudadano -- "llena el formulario" --> ESRI
 
-    AUTO -.->|dispara al crear/editar| WHODOO
-    WHODOO --> SYNCFWD
+    classDef odoo fill:#714B67,stroke:#4a2f43,color:#ffffff
+    classDef api fill:#00897B,stroke:#00564d,color:#ffffff
+    classDef esri fill:#0079C1,stroke:#004f7e,color:#ffffff
+    classDef actor fill:#F2A900,stroke:#a87500,color:#1a1a1a
 
-    LAYER -->|features sin vincular| SYNCREV
-    SYNCREV -->|crea tarea + contacto| TASK
+    class task,partner,rule odoo
+    class endpoints,sched,sync,clients api
+    class s123,layer esri
+    class ciudadano,operador actor
 
-    SURVEY -->|envía respuesta| LAYER
+    style ODOO fill:transparent,stroke:#714B67,stroke-width:2px
+    style API fill:transparent,stroke:#00897B,stroke-width:2px
+    style ESRI fill:transparent,stroke:#0079C1,stroke-width:2px
 
-    LAYER -.->|cambio de estado| WHARCGIS
-    WHARCGIS -->|actualiza etapa / nota| TASK
-
-    LAYER --> DASH
+    linkStyle 7 stroke:#714B67,stroke-width:3px
+    linkStyle 8 stroke:#00897B,stroke-width:2px
+    linkStyle 9 stroke:#00897B,stroke-width:2px
+    linkStyle 10 stroke:#0079C1,stroke-width:2px,stroke-dasharray:6 4
 ```
 
-La sincronización se puede ejecutar de cuatro maneras:
+- **Flecha gruesa morada:** push instantáneo de Odoo al microservicio (Automation Rule → `POST /webhook/odoo`).
+- **Flechas verdes:** llamadas que **siempre inicia `integration-api`** (XML-RPC a Odoo, ArcGIS API for Python a la capa).
+- **Flecha punteada azul:** `POST /webhook/arcgis` — el endpoint existe, pero hoy solo se dispara simulado con `curl` (sería real con ArcGIS Webhooks).
+- **Survey123 escribe directo en la capa**; nunca pasa por el microservicio. El microservicio detecta esos registros nuevos por polling (APScheduler).
 
-| Endpoint | Dirección | Cuándo se ejecuta |
+> Los diagramas están en **Mermaid**. GitHub y GitLab los renderizan de forma nativa. En VS Code hace falta la extensión
+> *Markdown Preview Mermaid Support* (`bierner.markdown-mermaid`) para verlos en la vista previa.
+
+Cada solicitud ciudadana es una tarea (`project.task`) dentro de un
+proyecto de Odoo, vinculada a un contacto (`res.partner`) que representa
+al ciudadano y lleva la geolocalización (`partner_latitude` /
+`partner_longitude`, módulo `base_geolocalize`). Esa misma solicitud
+existe como una **feature** (punto) en una Hosted Feature Layer de
+ArcGIS, enlazada a su tarea de Odoo por el campo `odoo_partner_id`
+(guarda el `id` de la `project.task`, no de un `res.partner` — nombre
+histórico conservado por compatibilidad con capas ya publicadas).
+
+---
+
+## 1. Flujos de sincronización
+
+| Sentido | Qué lo dispara | Qué hace | Función |
+|---|---|---|---|
+| Odoo → ArcGIS | Automation Rule de Odoo (push, cambio de `state`) · scheduler · `POST /sync/run` | crea/actualiza la feature (`upsert`, por `task_id`) | `sync.run_sync()` |
+| ArcGIS → Odoo (registro nuevo) | scheduler (polling) · `POST /sync/reverse` | crea contacto + tarea en Odoo y escribe de vuelta el vínculo + status inicial | `sync.run_reverse_sync()` |
+| ArcGIS → Odoo (cambio de estado) | `POST /webhook/arcgis` (hoy simulado con `curl`) | mueve el `state` de la tarea y deja nota en el chatter | `sync.handle_arcgis_status_webhook()` |
+| Reconciliación | scheduler · `POST /sync/reconcile` | borra en ArcGIS las features cuya tarea de Odoo ya no existe | `sync.run_reconciliation()` |
+
+El scheduler (`APScheduler`, arrancado en `main.py`) corre **`run_sync`,
+`run_reverse_sync` y `run_reconciliation`** cada `SYNC_INTERVAL_MINUTES`.
+`handle_arcgis_status_webhook` **no** está en el scheduler: solo corre
+cuando llega un `POST /webhook/arcgis`. Ver sección 6 para el setup
+semi-automático / automático.
+
+### 1.1. Survey123 → Odoo: registro nuevo (semi-automático, idempotente)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Ciudadano
+    box rgba(0,121,193,0.12) ArcGIS Online / Enterprise
+        participant S as Survey123
+        participant L as Feature Layer
+    end
+    box rgba(0,137,123,0.12) Microservicio
+        participant API as integration-api
+    end
+    box rgba(113,75,103,0.12) Odoo
+        participant O as Odoo
+    end
+
+    C->>S: Llena y envía el formulario
+    S->>L: addFeatures (odoo_partner_id = NULL)
+
+    Note over API: APScheduler dispara run_reverse_sync()<br/>cada SYNC_INTERVAL_MINUTES (ej. 1 min)
+
+    API->>L: query(odoo_partner_id IS NULL, out_sr=4326)
+    L-->>API: features nuevas (lat/lon en grados WGS84)
+
+    loop por cada feature sin vincular
+        API->>L: claim_feature() → odoo_partner_id = -1
+        Note right of L: una corrida solapada ya no la ve<br/>(deja de ser NULL) → sin duplicados
+        alt creación OK
+            API->>O: create res.partner (citizen_name, email, lat/lon)
+            API->>O: create project.task (name, partner_id)
+            API->>O: read state → etiqueta ("In Progress")
+            API->>L: link_new_feature() → odoo_partner_id = task_id + status
+        else error en Odoo
+            API->>L: release_claim() → odoo_partner_id = NULL
+            Note right of L: se reintenta en la próxima corrida
+        end
+    end
+```
+
+### 1.2. Odoo → ArcGIS: cambio de estado (push instantáneo)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Op as Operador municipal
+    box rgba(113,75,103,0.12) Odoo
+        participant O as project.task / res.partner
+        participant R as Automation Rule
+    end
+    box rgba(0,137,123,0.12) Microservicio
+        participant API as integration-api
+    end
+    box rgba(0,121,193,0.12) ArcGIS Online / Enterprise
+        participant L as Feature Layer
+    end
+
+    Op->>O: Cambia el estado de la tarea (Kanban / formulario)
+    O->>R: On Update (trigger field: state)
+    R->>API: POST /webhook/odoo
+    API->>O: search_read project.task + res.partner (XML-RPC)
+    O-->>API: tareas + contactos + state (código → etiqueta)
+
+    loop por cada tarea del proyecto
+        alt sin coordenadas
+            Note over API: skipped_no_coordinates
+        else feature ya existe (odoo_partner_id = task_id)
+            API->>L: updateFeatures (status, atributos, geometría wkid 4326)
+        else feature no existe
+            API->>L: addFeatures
+        end
+    end
+
+    API-->>R: 200 {status: "applied", summary}
+    Note over O,L: Las tareas NUEVAS creadas en Odoo (no solo cambios de state)<br/>llegan por el scheduler, que también corre run_sync()
+```
+
+### 1.3. Reconciliación: limpieza de huérfanos en ArcGIS
+
+```mermaid
+sequenceDiagram
+    autonumber
+    box rgba(0,137,123,0.12) Microservicio
+        participant API as integration-api
+    end
+    box rgba(0,121,193,0.12) ArcGIS Online / Enterprise
+        participant L as Feature Layer
+    end
+    box rgba(113,75,103,0.12) Odoo
+        participant O as Odoo
+    end
+
+    Note over API: APScheduler o POST /sync/reconcile<br/>→ run_reconciliation()
+
+    API->>L: query(odoo_partner_id IS NOT NULL y ≠ -1)
+    L-->>API: features vinculadas (objectid, task_id)
+    API->>O: search project.task id IN (task_ids)
+    O-->>API: ids que todavía existen
+
+    alt hay features huérfanas (su tarea fue borrada en Odoo)
+        API->>L: deleteFeatures(objectids huérfanos)
+        Note right of L: Odoo es la fuente de verdad:<br/>ArcGIS refleja exactamente el mismo conjunto
+    else todo cuadra
+        Note over API: orphaned_deleted = 0
+    end
+```
+
+### 1.4. Cambio de estado desde ArcGIS (`/webhook/arcgis`)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant X as curl (hoy) / ArcGIS Webhook (futuro)
+    box rgba(0,137,123,0.12) Microservicio
+        participant API as integration-api
+    end
+    box rgba(113,75,103,0.12) Odoo
+        participant O as Odoo
+    end
+
+    X->>API: POST /webhook/arcgis {odoo_task_id, new_status, note}
+    alt la etiqueta new_status existe en state
+        API->>O: write project.task.state = código
+    else etiqueta desconocida
+        Note over API: no mueve el estado, solo deja nota
+    end
+    API->>O: message_post en el chatter de la tarea
+    API-->>X: 200 {status: "applied"}
+    Note over API,O: el cambio de state dispara la Automation Rule de Odoo<br/>→ vuelve a ArcGIS por el flujo Odoo → ArcGIS
+```
+
+---|---|---|---|
+| Odoo → ArcGIS | tarea nueva o cambio de campos | crea/actualiza la feature (`upsert`, por `task_id`) | `sync.run_sync()` |
+| ArcGIS → Odoo | feature nueva sin `odoo_partner_id` (Survey123 o edición manual) | crea contacto + tarea en Odoo, y escribe de vuelta el vínculo + status inicial | `sync.run_reverse_sync()` |
+| ArcGIS → Odoo | cambio de estado recibido por webhook (real o simulado) | mueve el `state` de la tarea y deja nota en el chatter | `sync.handle_arcgis_status_webhook()` |
+| Reconciliación | periódica | borra en ArcGIS las features cuya tarea de Odoo ya no existe | `sync.run_reconciliation()` |
+
+Las tres primeras están detrás de endpoints manuales (`POST /sync/run`,
+`POST /sync/reverse`, `POST /webhook/arcgis`) y las tres primeras + la
+reconciliación corren también **automáticamente** cada
+`SYNC_INTERVAL_MINUTES` vía un scheduler (`APScheduler`) arrancado en
+`main.py`. Ver sección 6 para cómo dejar esto en modo semi-automático /
+automático de verdad.
+
+---
+
+## 2. Modelo de datos
+
+| Campo Odoo | Campo ArcGIS | Notas |
 |---|---|---|
-| `POST /sync/run` | Odoo → ArcGIS | Manualmente, mediante polling o desde `/webhook/odoo` |
-| `POST /webhook/odoo` | Odoo → ArcGIS | Cuando una Automation Rule de Odoo detecta una creación o modificación |
-| `POST /sync/reverse` | ArcGIS → Odoo | Manualmente o mediante polling para detectar nuevos registros |
-| `POST /webhook/arcgis` | ArcGIS → Odoo | Cuando cambia el estado de una entidad ya vinculada |
+| `project.task.id` | `odoo_partner_id` | clave de enlace entre ambos sistemas |
+| `project.task.name` | `name` | descripción del problema/solicitud — **no** es el nombre del ciudadano |
+| `project.task.state` | `status` | Selection field; se resuelve código→etiqueta con `fields_get` |
+| `res.partner.name` | `citizen_name` | nombre del ciudadano |
+| `res.partner.street` | `address` | |
+| `res.partner.city` | `city` | |
+| `res.partner.phone` | `phone` | |
+| `res.partner.email` | `email` | |
+| `res.partner.partner_latitude/longitude` | geometría (punto, WGS84) | |
 
-El polling permite mantener el ejemplo sencillo y no depende de configuraciones adicionales. Los webhooks pueden utilizarse cuando se necesita una actualización más inmediata.
+### 2.1. `state` vs `stage_id` (Odoo)
+
+`project.task` tiene **dos** conceptos de "estado" distintos:
+
+- `stage_id`: la columna Kanban (`many2one` a `project.task.type`).
+- `state`: un campo `Selection` con un código interno por valor (p. ej.
+  `"01_in_progress"`), independiente del Kanban.
+
+Esta integración usa **`state`**, no `stage_id`. El código interno nunca
+se hardcodea: `OdooClient._get_state_label_map()` lo resuelve
+dinámicamente vía `fields_get(["state"], ["selection"])`, así que
+funciona aunque el proyecto personalice las etiquetas.
+
+### 2.2. `citizen_name` vs `name` (bug corregido en esta sesión)
+
+Al crear una tarea desde una feature de ArcGIS/Survey123
+(`create_task_from_arcgis`), el nombre del **contacto** (`res.partner`)
+debe salir de `citizen_name` (lo que la persona escribió en "Tu nombre
+completo" en el formulario). `name` es la descripción del problema y se
+usa solo como título de la tarea. Antes se usaba `name` para ambos, así
+que el contacto terminaba llamándose "Robo" o "Un lindo gatito en la
+avenida" en vez del nombre real del ciudadano.
 
 ---
 
-## 3. Estructura del proyecto
+## 3. Requisitos previos
 
-```text
-IntegracionOdooArcGIS/
-├── docker-compose.yml
-├── .env.example
-├── odoo/
-│   ├── config/odoo.conf
-│   └── addons/
-├── integration-api/
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   ├── .env.example
-│   └── app/
-│       ├── main.py               # endpoints + scheduler
-│       ├── config.py             # configuración y App Authentication
-│       ├── schemas.py
-│       ├── odoo_client.py        # XML-RPC: project.task + res.partner
-│       ├── arcgis_client.py      # ArcGIS API for Python
-│       └── sync.py               # lógica de sincronización
-├── scripts/
-│   ├── requirements.txt
-│   ├── seed_odoo_demo_data.py
-│   ├── create_arcgis_feature_layer.py
-│   └── plantilla_capa_arcgis.csv
-└── README.md
+- Odoo (Community/Enterprise) con el módulo `project` y
+  `base_geolocalize` instalados, con un proyecto dedicado a las
+  solicitudes ciudadanas.
+- Usuario técnico de Odoo con acceso a `project.task` y `res.partner`
+  (XML-RPC External API habilitado — viene por defecto).
+- ArcGIS Online o Enterprise 10.9+ con una Hosted Feature Layer
+  publicada con, como mínimo, los campos: `odoo_partner_id` (numérico),
+  `name`, `citizen_name`, `address`, `city`, `phone`, `email`, `status`
+  (texto), y geometría de punto.
+- Credenciales de ArcGIS: usuario/contraseña, o preferible **App
+  Authentication (OAuth 2.0 client credentials)** — no depende de un
+  usuario humano ni se ve afectada por MFA. Requiere que la app OAuth
+  tenga acceso concedido al item de la capa.
+- Docker + Docker Compose para desplegar `integration-api`.
+- (Opcional, para captura de campo) Survey123 Connect apuntando a la
+  misma Hosted Feature Layer.
+
+---
+
+## 4. Variables de entorno (`integration-api/.env`)
+
+```env
+# Odoo
+ODOO_URL=https://tu-instancia-odoo.com
+ODOO_DB=nombre_bd
+ODOO_USERNAME=usuario_tecnico
+ODOO_PASSWORD=************
+ODOO_PROJECT_NAME=Solicitudes Ciudadanas
+
+# ArcGIS
+ARCGIS_URL=https://www.arcgis.com          # o tu portal Enterprise
+ARCGIS_FEATURE_LAYER_ITEM_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+ARCGIS_VERIFY_CERT=true
+
+# Opción A: usuario/contraseña
+ARCGIS_USERNAME=usuario
+ARCGIS_PASSWORD=************
+
+# Opción B (recomendada): App Authentication
+ARCGIS_CLIENT_ID=************
+ARCGIS_CLIENT_SECRET=************
+
+# Sincronización automática (minutos). Ver sección 6.
+SYNC_INTERVAL_MINUTES=1
 ```
 
-El proyecto está separado en tres partes principales:
-
-- **Odoo + PostgreSQL**: almacena las solicitudes y los ciudadanos.
-- **Integration API**: contiene la lógica que conecta ambos sistemas.
-- **Scripts**: permiten preparar datos de demostración y crear la capa de ArcGIS.
+> **Seguridad:** nunca commitear `.env` al repo. Las credenciales que se
+> compartieron durante las pruebas de esta demo deben rotarse antes de
+> mostrarla a un municipio real.
 
 ---
 
-## 4. Requisitos previos
-
-Antes de iniciar el proyecto se necesita contar con:
-
-- Docker y Docker Compose v2.
-- Una organización de **ArcGIS Online** con permisos para publicar Hosted Feature Layers, o una instalación de **ArcGIS Enterprise** con permisos equivalentes.
-- Python 3.10–3.13 para ejecutar los scripts auxiliares.
-- Puerto `8069` disponible para Odoo.
-- Puerto `8000` disponible para la Integration API.
-
-Si la cuenta de ArcGIS utiliza **MFA o SSO corporativo**, no se debe asumir que el inicio de sesión mediante usuario y contraseña funcionará. En ese caso, es necesario utilizar **App Authentication**, explicado en la sección [5.3](#53-configuración-de-autenticación).
-
----
-
-# 5. Despliegue
-
-El despliegue está dividido en varios pasos porque algunas configuraciones dependen de recursos creados previamente.
-
-En particular, primero debe existir la Hosted Feature Layer antes de poder limitar el acceso de una aplicación a ese elemento.
-
-```mermaid
-flowchart TD
-    A["5.1 Levantar Odoo + PostgreSQL"] --> E["5.4 Configurar y levantar<br/>integration-api"]
-
-    B["5.2 Publicar la Hosted<br/>Feature Layer"] --> C["5.2 Habilitar edición en la capa<br/>(Settings → Editing options)"]
-
-    B --> D["5.3 Registrar App Authentication<br/>(Client ID / Client Secret)"]
-
-    D --> D2["5.3 Otorgar acceso a la capa<br/>ya publicada<br/>(Grant access to specific items)"]
-
-    C --> E
-    D2 --> E
-    A --> F["5.5 Crear datos de referencia en Odoo"]
-
-    E --> G["5.6 Activar sincronización automática"]
-    F --> G
-
-    G --> H["Verificar en ArcGIS:<br/>pestaña Data de la capa"]
-```
-
-Los pasos **5.1** y **5.2/5.3** pueden realizarse de forma independiente.
-
-Dentro de ArcGIS, en cambio, la secuencia importante es:
-
-1. Publicar la capa.
-2. Configurar su edición.
-3. Registrar la aplicación.
-4. Dar a la aplicación acceso a la capa.
-
----
-
-## 5.1 Levantar Odoo y PostgreSQL
-
-Desde la raíz del proyecto:
+## 5. Despliegue
 
 ```bash
-cp .env.example .env
-docker compose up -d db odoo
-docker compose logs -f odoo
-```
-
-Es necesario esperar hasta que Odoo indique que el servicio HTTP está disponible, por ejemplo:
-
-```text
-HTTP service (werkzeug) running
-```
-
-Luego se puede acceder desde:
-
-```text
-http://localhost:8069
-```
-
-Durante la configuración inicial crea una base de datos llamada:
-
-```text
-odoo_demo
-```
-
-El nombre debe coincidir con el valor definido en `ODOO_DB` y con la configuración de `dbfilter` utilizada en `odoo.conf`.
-
-Una vez creada la base, activa el módulo:
-
-**Apps → Project → Activate**
-
----
-
-## 5.2 Crear la Hosted Feature Layer en ArcGIS
-
-La capa puede crearse automáticamente utilizando el script incluido en el proyecto.
-
-Desde la carpeta `scripts`:
-
-```bash
-cd scripts
-python -m venv .venv
-```
-
-En Windows:
-
-```bash
-.venv\Scripts\activate
-```
-
-En Linux/macOS:
-
-```bash
-source .venv/bin/activate
-```
-
-Instala las dependencias:
-
-```bash
-pip install -r requirements.txt
-```
-
-Copia el archivo de configuración:
-
-```bash
-cp ../integration-api/.env.example .env
-```
-
-Completa los valores correspondientes:
-
-```text
-ARCGIS_USERNAME
-ARCGIS_PASSWORD
-ARCGIS_URL
-```
-
-Finalmente:
-
-```bash
-python create_arcgis_feature_layer.py
-```
-
-El script crea la Hosted Feature Layer con las capacidades necesarias:
-
-```text
-Create,Delete,Query,Update,Editing
-```
-
-Por lo tanto, cuando la capa se crea mediante el script no es necesario habilitar manualmente la edición.
-
-### Publicación manual
-
-La publicación manual es especialmente útil cuando la organización utiliza **MFA**, SSO o cuando el Hosting Server de Enterprise presenta problemas durante la creación automática.
-
-El procedimiento es:
-
-1. Entrar a ArcGIS Online o Portal.
-2. Ir a **Content → New Item**.
-3. Seleccionar la opción para cargar un archivo.
-4. Utilizar:
-
-```text
-scripts/plantilla_capa_arcgis.csv
-```
-
-5. Continuar con el asistente de publicación.
-6. ArcGIS reconocerá los campos `latitude` y `longitude` para crear la geometría de puntos.
-7. Publicar la capa.
-
-Después de publicarla, guarda el **Item ID**. Se puede identificar directamente desde la URL:
-
-```text
-.../home/item.html?id=XXXXXXXX
-```
-
-La Integration API utiliza ese identificador para localizar la capa.
-
-Ambos métodos de publicación son compatibles con el resto del proyecto.
-
-El código también identifica de forma dinámica el campo `ObjectID`, por lo que puede trabajar tanto con:
-
-```text
-OBJECTID
-```
-
-como con:
-
-```text
-objectid
-```
-
-### Habilitar edición después de una publicación mediante CSV
-
-Cuando la capa se publica desde un CSV, la edición puede quedar deshabilitada inicialmente.
-
-En ese caso:
-
-1. Abrir la capa.
-2. Ir a **Settings**.
-3. Buscar **Editing options**.
-4. Activar **Enable editing**.
-5. En las capacidades de edición permitir al menos:
-   - Add
-   - Update
-   - Attributes
-   - Geometry
-6. Guardar los cambios.
-
-Este paso es necesario porque, aunque el usuario o la aplicación tengan permisos sobre el elemento, una capa que no permite edición no aceptará llamadas como `edit_features()`.
-
-Cuando esto ocurre, la API puede devolver:
-
-```text
-This operation is not supported
-```
-
-con código:
-
-```text
-400
-```
-
----
-
-## 5.3 Configuración de autenticación
-
-La Integration API puede autenticarse contra ArcGIS de dos formas:
-
-| Escenario | Configuración |
-|---|---|
-| Cuenta sin MFA | `ARCGIS_USERNAME` / `ARCGIS_PASSWORD` |
-| MFA o SSO corporativo | `ARCGIS_CLIENT_ID` / `ARCGIS_CLIENT_SECRET` |
-| Enterprise con certificado autofirmado | Configuración anterior + `ARCGIS_VERIFY_CERT=False` |
-
-Para entornos donde se utiliza MFA o SSO, se recomienda **App Authentication**, ya que el microservicio no necesita realizar un inicio de sesión interactivo.
-
-### Crear las credenciales de la aplicación
-
-En ArcGIS:
-
-**Content → My Content → New item → Developer credentials**
-
-Selecciona:
-
-```text
-OAuth 2.0 credentials
-```
-
-y específicamente la opción:
-
-```text
-For app authentication
-```
-
-No se debe seleccionar la opción destinada al inicio de sesión interactivo de usuarios.
-
-El flujo completo es:
-
-```mermaid
-flowchart TD
-    A["Content → New Item →<br/>Developer credentials"]
-    --> B["Select credential type:<br/>OAuth 2.0 credentials<br/>(For app authentication)"]
-
-    B --> C["Where will you use these credentials?<br/>Private application with<br/>selected privileges"]
-
-    C --> D{"¿La capa ya<br/>está publicada?"}
-
-    D -->|No todavía| E["Item access: No item access"]
-    D -->|Sí| F["Item access: Grant access<br/>to specific items → seleccionar la capa"]
-
-    E --> G["Privileges (Location services):<br/>desactivar todo, incluido Basemaps"]
-    F --> G
-
-    G --> H["Referrer URLs: dejar vacío"]
-    H --> I["Item details: Title"]
-    I --> J["Create → copiar<br/>Client ID y Client Secret"]
-
-    E -.->|"Después de publicar la capa"| K["Credentials → Edit →<br/>Grant access to specific items"]
-```
-
-### Configuración paso a paso
-
-**1. Crear las credenciales**
-
-Ve a:
-
-**Content → My Content → New item → Developer credentials**
-
----
-
-**2. Seleccionar el tipo de credencial**
-
-Selecciona:
-
-```text
-OAuth 2.0 credentials
-```
-
-y dentro de esta opción:
-
-```text
-For app authentication
-```
-
-Esta es la modalidad utilizada por el backend para autenticarse sin intervención de un usuario.
-
----
-
-**3. Definir dónde se utilizarán las credenciales**
-
-Selecciona:
-
-```text
-Private application with selected privileges
-```
-
-No es necesario otorgar todos los privilegios disponibles.
-
----
-
-**4. Configurar el acceso a elementos**
-
-Si la capa todavía no existe:
-
-```text
-No item access
-```
-
-Si la capa ya fue publicada:
-
-```text
-Grant access to specific items
-```
-
-Después:
-
-```text
-Browse items
-```
-
-y selecciona la Hosted Feature Layer creada en el paso anterior.
-
-Si la aplicación se creó antes que la capa, el acceso se puede configurar posteriormente editando las credenciales.
-
----
-
-**5. Configurar los privilegios**
-
-El proyecto solamente necesita consultar y modificar entidades de la capa.
-
-No utiliza servicios de:
-
-- Basemaps
-- Geocoding
-- Routing
-- Data enrichment
-
-Por lo tanto, estos privilegios pueden permanecer desactivados, incluido **Basemaps**.
-
----
-
-**6. Referrer URLs**
-
-Para esta integración se deja el campo vacío.
-
-La razón es que el `Client Secret` se utiliza exclusivamente desde el backend y nunca se expone al navegador.
-
----
-
-**7. Información de la aplicación**
-
-Define un título, por ejemplo:
-
-```text
-integration-api-odoo
-```
-
-El título es obligatorio.
-
-Después selecciona:
-
-```text
-Create
-```
-
----
-
-**8. Guardar las credenciales**
-
-En la sección de la aplicación aparecerán:
-
-```text
-Client ID
-Client Secret
-```
-
-Guárdalos en un lugar seguro.
-
-El `Client Secret` debe tratarse con el mismo cuidado que una contraseña. En particular, no debe incluirse en el repositorio, capturas de pantalla o archivos compartidos.
-
-Si inicialmente seleccionaste `No item access`, una vez publicada la capa puedes volver a:
-
-**Credentials → Edit → Grant access to specific items**
-
-y seleccionar la capa correspondiente.
-
-### Dos permisos diferentes
-
-Es importante distinguir entre:
-
-**Acceso de la aplicación al elemento**
-
-y
-
-**Capacidad de edición de la capa**.
-
-El primero se configura mediante:
-
-```text
-Grant access to specific items
-```
-
-El segundo se configura desde:
-
-```text
-Settings → Editing
-```
-
-Si falta el acceso al elemento, es posible obtener un:
-
-```text
-403
-```
-
-Si la aplicación tiene acceso, pero la capa no permite edición, una operación de edición puede devolver:
-
-```text
-400 - This operation is not supported
-```
-
-### ArcGIS Enterprise
-
-En ArcGIS Enterprise el procedimiento es equivalente.
-
-La diferencia principal es que `ARCGIS_URL` debe apuntar a la URL del Portal accesible mediante el Web Adaptor, en lugar de:
-
-```text
-https://www.arcgis.com
-```
-
-La disponibilidad de algunas opciones puede variar según la versión y configuración de Enterprise.
-
-Una vez configurado `ARCGIS_CLIENT_ID` y `ARCGIS_CLIENT_SECRET`, `arcgis_client.py` utiliza estas credenciales para conectarse sin solicitar un inicio de sesión interactivo.
-
----
-
-## 5.4 Configurar y levantar la Integration API
-
-Desde la raíz del proyecto:
-
-```bash
-cd integration-api
-cp .env.example .env
-```
-
-Completa las variables relacionadas con:
-
-```text
-ODOO_*
-ARCGIS_*
-```
-
-y añade el identificador de la capa:
-
-```text
-ARCGIS_FEATURE_LAYER_ITEM_ID
-```
-
-Este valor corresponde al Item ID obtenido durante la publicación de la Hosted Feature Layer.
-
-Después vuelve a la raíz del proyecto:
-
-```bash
-cd ..
 docker compose up -d --build integration-api
 ```
 
-Para revisar el arranque:
+### ⚠️ Gotcha recurrente: `--force-recreate` NO reconstruye la imagen
+
+`docker compose up -d --force-recreate integration-api` recrea el
+**contenedor** a partir de la **imagen ya existente en caché**. Como el
+`Dockerfile` copia el código fuente dentro de la imagen en build-time,
+**editar los `.py` en disco no tiene ningún efecto hasta que la imagen
+se reconstruye explícitamente**. Durante esta sesión, varios "bugs"
+reportados (nombre de contacto sin corregir, `/sync/reconcile`
+devolviendo 404 pese a que `/health` respondía bien) en realidad eran el
+contenedor sirviendo código viejo tras un `--force-recreate` sin
+`--build`.
+
+**Siempre que cambies código:**
 
 ```bash
-docker compose logs -f integration-api
-```
-
-La API debería quedar disponible en:
-
-```text
-http://localhost:8000
-```
-
-Puedes comprobar el estado con:
-
-```text
-http://localhost:8000/health
-```
-
-La respuesta esperada es:
-
-```json
-{
-  "status": "ok"
-}
-```
-
-La documentación interactiva de FastAPI está disponible en:
-
-```text
-http://localhost:8000/docs
+docker compose up -d --build --force-recreate integration-api
 ```
 
 ---
 
-## 5.5 Crear datos de referencia en Odoo
+## 6. Sincronización automática / semi-automática
 
-El proyecto incluye un script para generar información de demostración.
+Estado actual (sin ArcGIS Webhooks disponibles — ver nota al final de
+esta sección): el sentido **ArcGIS → Odoo** funciona por **polling**
+ajustado a un intervalo corto, y el sentido **Odoo → ArcGIS** funciona
+por **push instantáneo** vía una Automation Rule nativa de Odoo. No hace
+falta tocar código en ninguno de los dos casos — ambos endpoints y el
+scheduler ya existen.
 
-Desde la carpeta `scripts`:
+### 6.1. ArcGIS → Odoo: nuevo registro en la capa (semi-automático, polling)
+
+El scheduler de `main.py` ya ejecuta `run_reverse_sync()` (además de
+`run_sync()` y `run_reconciliation()`) cada `SYNC_INTERVAL_MINUTES`.
+Para que un registro nuevo en la capa (cargado desde Survey123 o
+editado manualmente) llegue a Odoo casi al instante, basta con bajar el
+intervalo:
+
+```env
+SYNC_INTERVAL_MINUTES=1
+```
+
+y redesplegar:
 
 ```bash
-python seed_odoo_demo_data.py
+docker compose up -d --build --force-recreate integration-api
 ```
 
-El script crea ocho solicitudes de ejemplo, incluyendo:
+Con esto, cualquier envío de Survey123 tarda como máximo ~1 minuto en
+aparecer como tarea en Odoo, con su contacto, estado inicial y
+coordenadas correctas.
 
-- proyecto;
-- tareas;
-- contactos;
-- relación entre las tareas y sus respectivos ciudadanos;
-- coordenadas de referencia en Quito.
+No es push real (no hay notificación instantánea desde ArcGIS), pero
+para una demo es indistinguible de "automático": el ciudadano llena el
+formulario y en menos de un minuto la solicitud ya está en Odoo.
 
-### Alternativa manual
+**Alternativa real (push), para cuando esté disponible:** ArcGIS
+Enterprise 11.x+ o AGOL con **Webhooks** habilitados permite que la capa
+misma notifique al microservicio en el instante de un `Add`. En ese caso
+se agregaría un endpoint `POST /webhook/arcgis/feature-added` que
+registre la feature vía la API de Webhooks de la capa (`POST
+.../registerWebhook`) y dispare `run_reverse_sync()` (o, mejor, procese
+solo la feature notificada) al recibir el evento — eliminando el
+polling por completo. No implementado en esta demo porque el ambiente
+actual no tiene Webhooks habilitados.
 
-También es posible crear las solicitudes directamente desde Odoo.
+### 6.2. Odoo → ArcGIS: cambio de estado (automático, push real)
 
-1. Ir a **Project**.
-2. Abrir el proyecto configurado en `ODOO_PROJECT_NAME`.
-3. Por defecto, el proyecto se llama:
+Para este sentido **sí** existe push real y sin polling, usando la
+funcionalidad nativa de Odoo. El endpoint `POST /webhook/odoo` ya existe
+en `main.py` y simplemente ejecuta `sync.run_sync()` (sincroniza todas
+las tareas del proyecto — es idempotente, así que no hay costo en
+sincronizar de más).
 
-```text
-Solicitudes Ciudadanas
-```
+**Pasos en Odoo** (Ajustes → Técnico → Automatizaciones /
+*Settings → Technical → Automation → Automation Rules*; requiere modo
+desarrollador activado):
 
-4. Crear una nueva tarea.
-5. Asignar un cliente/contacto existente o crear uno nuevo.
-6. Verificar que el contacto tenga coordenadas.
-7. Guardar la tarea.
+1. **Nueva automatización** → *Model*: `Project Task` (`project.task`).
+2. *Trigger*: **On Update** (*Al actualizar*).
+3. *Trigger Fields* (campos disparadores): `state` — así la regla solo
+   se dispara cuando cambia el estado, no en cualquier edición de la
+   tarea.
+4. (Opcional pero recomendado) *Apply on* / dominio: limita a las tareas
+   del proyecto de esta integración, ej. `[('project_id.name', '=',
+   'Solicitudes Ciudadanas')]`, para no disparar sync en tareas de otros
+   proyectos.
+5. En **Acciones** → **Añadir una acción** → tipo **"Enviar notificación
+   webhook"** (*Send Webhook Notification*):
+   - **URL**: `http://integration-api:8000/webhook/odoo` si Odoo y
+     `integration-api` están en la misma red de Docker Compose (ej. red
+     `backend`); si Odoo corre fuera de ese Docker Compose, usa la URL
+     pública/accesible del microservicio, ej.
+     `https://tu-dominio.com/webhook/odoo`.
+   - **Método**: `POST`.
+   - **Cuerpo**: no requiere ningún campo específico — el endpoint
+     ignora el payload y simplemente corre la sincronización completa.
+6. Guardar y activar la regla.
 
-Las coordenadas pueden gestionarse desde los campos correspondientes de `res.partner`.
+Con esto, apenas alguien cambia el `state` de una tarea en Odoo (por el
+Kanban, el formulario, o programáticamente), Odoo llama de inmediato al
+microservicio y la feature en ArcGIS queda actualizada en segundos, sin
+esperar al ciclo del scheduler.
 
-Para una demostración resulta más práctico utilizar los contactos generados por `seed_odoo_demo_data.py`, ya que ya contienen coordenadas.
-
-Una vez creada la tarea, la sincronización la enviará a ArcGIS según el intervalo configurado.
-
-También es posible ejecutar la sincronización manualmente mediante:
-
-```text
-POST /sync/run
-```
+> Si tu versión de Odoo no tiene la acción nativa "Enviar notificación
+> webhook" (viene desde Odoo 17), la alternativa es una acción de
+> servidor en Python (*Execute Python Code*) que haga un `requests.post`
+> a la misma URL, o quedarte con el polling de `run_sync()` cada
+> `SYNC_INTERVAL_MINUTES` igual que en el sentido inverso.
 
 ---
 
-## 5.6 Activar la sincronización automática
+## 7. Idempotencia y reconciliación
 
-La Integration API incorpora un scheduler que ejecuta periódicamente la sincronización en ambas direcciones.
+Implementadas a pedido explícito para garantizar que **una misma
+feature nunca genere dos tareas duplicadas en Odoo**, y que **ArcGIS
+nunca quede con referencias a tareas que ya no existen en Odoo**.
 
-El intervalo se define mediante:
+### Ciclo de vida de `odoo_partner_id` en una feature
 
-```text
-SYNC_INTERVAL_MINUTES
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Sin vincular" as SinVincular
+    state "Reclamada" as Reclamada
+    state "Vinculada" as Vinculada
+
+    SinVincular : odoo_partner_id = NULL
+    Reclamada : odoo_partner_id = -1
+    Reclamada : (en proceso)
+    Vinculada : odoo_partner_id = task_id
+    Vinculada : run_sync() mantiene status al día
+
+    [*] --> SinVincular : Survey123 / edición manual
+    [*] --> Vinculada : run_sync() crea la feature<br/>desde una tarea de Odoo
+    SinVincular --> Reclamada : claim_feature()
+    Reclamada --> Vinculada : tarea creada en Odoo<br/>link_new_feature()
+    Reclamada --> SinVincular : error en Odoo<br/>release_claim()
+    Vinculada --> [*] : tarea borrada en Odoo<br/>run_reconciliation()<br/>borra la feature
+
+    classDef nulo fill:#F2A900,stroke:#a87500,color:#1a1a1a
+    classDef claim fill:#E65100,stroke:#8c3100,color:#ffffff
+    classDef ok fill:#00897B,stroke:#00564d,color:#ffffff
+    class SinVincular nulo
+    class Reclamada claim
+    class Vinculada ok
 ```
 
-Por ejemplo:
+### 7.1. Claim/release (evita duplicados en `run_reverse_sync`)
 
-```text
-SYNC_INTERVAL_MINUTES=2
-```
+Antes de crear la tarea en Odoo para una feature sin vincular, se
+"reclama" la feature escribiendo un valor centinela (`-1`, ningún
+`project.task` real tiene ese id) en `odoo_partner_id`
+(`ArcGISClient.claim_feature`). Si dos corridas se solapan (el
+scheduler y un `POST /sync/reverse` manual al mismo tiempo, por
+ejemplo), la segunda ya no ve esa feature como "sin vincular"
+(`get_unlinked_features` filtra por `odoo_partner_id IS NULL`) y no crea
+una tarea duplicada. Si la creación en Odoo falla después del claim, se
+revierte (`release_claim`, vuelve a `NULL`) para que se reintente en la
+próxima corrida en vez de quedar huérfana para siempre con el centinela.
 
-Después de modificar `.env`, es importante recrear el contenedor:
+### 7.2. Reconciliación (limpia huérfanos en ArcGIS)
 
-```bash
-docker compose up -d --force-recreate integration-api
-```
+`sync.run_reconciliation()` (job periódico + `POST /sync/reconcile`)
+recorre las features **vinculadas** en ArcGIS
+(`odoo_partner_id IS NOT NULL` y distinto del centinela), verifica
+contra Odoo cuáles `task_id` siguen existiendo
+(`OdooClient.filter_existing_task_ids`), y **borra** en ArcGIS las
+features cuya tarea ya no existe (por ejemplo, al borrar manualmente en
+Odoo un registro de prueba duplicado). Lo que hay en Odoo es la fuente
+de verdad; ArcGIS debe reflejar exactamente ese conjunto.
 
-En este caso se utiliza `--force-recreate` en lugar de `restart`, ya que un simple reinicio del contenedor no garantiza que se vuelvan a cargar los valores modificados del `.env`.
-
-En los logs debería aparecer un mensaje similar a:
-
-```text
-Sincronización automática (ambas direcciones) activada cada 2 minutos
-```
-
-A partir de ese momento, una solicitud creada o modificada en Odoo debería aparecer en la Hosted Feature Layer dentro del intervalo configurado.
-
-### Push inmediato desde Odoo
-
-También se puede complementar el polling con una **Automation Rule** para enviar inmediatamente las modificaciones a la Integration API.
-
-En Odoo:
-
-1. Activar el modo desarrollador.
-2. Ir a **Technical → Automations**.
-3. Crear una nueva regla.
-4. Seleccionar el modelo **Project Task**.
-5. Configurar el disparador para creación/modificación.
-6. Añadir una acción de tipo webhook.
-7. Utilizar:
-
-```text
-http://integration-api:8000/webhook/odoo
-```
-
-Cuando Odoo y la API están dentro de Docker Compose, se debe utilizar el nombre del servicio:
-
-```text
-integration-api
-```
-
-y no:
-
-```text
-localhost
-```
+> **Fuera de alcance, a propósito:** la deduplicación de envíos
+> *legítimos pero repetidos* de un mismo ciudadano (dos submits de
+> Survey123 con contenido parecido, ej. "Un lindo gatito en la avenida"
+> enviado dos veces por error del cliente) **no** se implementó. Sería
+> una heurística de similitud de contenido/ubicación/tiempo, con riesgo
+> real de fusionar dos reportes distintos de dos ciudadanos distintos.
+> Si el municipio lo pide, es una función aparte y explícita, no un
+> efecto colateral de la reconciliación.
 
 ---
 
-## 5.7 Ejecutar una sincronización manual
+## 8. Referencia de endpoints
 
-Si se quiere probar el flujo sin esperar al scheduler:
-
-```bash
-curl -X POST http://localhost:8000/sync/run
-```
-
-Una respuesta correcta puede tener esta estructura:
-
-```json
-{
-  "ok": true,
-  "fetched_from_odoo": 8,
-  "created_in_arcgis": 8,
-  "updated_in_arcgis": 0,
-  "skipped_no_coordinates": 0,
-  "errors": []
-}
-```
-
-Los campos permiten comprobar rápidamente qué ocurrió durante la ejecución:
-
-- `fetched_from_odoo`: registros obtenidos desde Odoo.
-- `created_in_arcgis`: entidades nuevas creadas en ArcGIS.
-- `updated_in_arcgis`: entidades existentes que fueron actualizadas.
-- `skipped_no_coordinates`: registros descartados por no tener coordenadas.
-- `errors`: errores encontrados durante el proceso.
-
----
-
-# 6. Flujo inverso: ArcGIS / Survey123 → Odoo
-
-La integración también funciona en sentido contrario.
-
-Una entidad creada directamente en ArcGIS puede convertirse en una nueva solicitud de Odoo.
-
-Esto permite, por ejemplo, que una persona registre información desde Survey123 y que esa información termine generando automáticamente una tarea en Odoo.
-
----
-
-## 6.1 Actualizar el estado de una solicitud existente
-
-Cuando una entidad de ArcGIS ya está vinculada con una tarea de Odoo, un cambio de estado puede reflejarse nuevamente en Odoo.
-
-Para una implementación con **Feature Layer Webhooks**, la capa debe tener habilitado el seguimiento de cambios.
-
-En la configuración de la capa:
-
-**Settings → Editing → Keep track of changes to data**
-
-Después se puede configurar un webhook con:
-
-```text
-http://<host-accesible>:8000/webhook/arcgis
-```
-
-y utilizar el evento:
-
-```text
-FeaturesUpdated
-```
-
-El payload enviado por un webhook nativo de ArcGIS no tiene necesariamente la misma estructura que el modelo simplificado utilizado por `ArcGISWebhookPayload` en `schemas.py`.
-
-Por eso, para producción sería necesario incorporar un adaptador que transforme el payload nativo antes de procesarlo.
-
-### Prueba manual
-
-Para probar el comportamiento sin configurar un webhook nativo:
-
-```bash
-curl -X POST http://localhost:8000/webhook/arcgis \
-  -H "Content-Type: application/json" \
-  -d '{"odoo_task_id": 3, "new_status": "Approved", "note": "Cuadrilla atendió el reporte"}'
-```
-
-El valor de:
-
-```text
-new_status
-```
-
-debe coincidir exactamente con una etapa existente en:
-
-```text
-project.task.type
-```
-
-Por ejemplo:
-
-```text
-In Progress
-Approved
-Done
-```
-
-Si la etapa no coincide, el cambio de estado no podrá aplicarse directamente. La información recibida todavía puede registrarse como una nota en el chatter de la tarea.
-
----
-
-## 6.2 Detectar nuevas entidades en ArcGIS
-
-Para revisar si existen entidades que todavía no están vinculadas con Odoo:
-
-```bash
-curl -X POST http://localhost:8000/sync/reverse
-```
-
-Una respuesta típica es:
-
-```json
-{
-  "ok": true,
-  "created_in_odoo": 2,
-  "errors": []
-}
-```
-
-El proceso busca entidades que no tengan valor en:
-
-```text
-odoo_partner_id
-```
-
-Cuando encuentra una entidad nueva:
-
-1. crea el contacto en Odoo;
-2. crea la tarea asociada;
-3. relaciona la tarea con el contacto;
-4. escribe el identificador correspondiente en ArcGIS.
-
-De esta manera, la misma entidad no vuelve a procesarse en las siguientes ejecuciones.
-
----
-
-## 6.3 Incorporar Survey123
-
-No es necesario modificar el código de la Integration API para incorporar Survey123.
-
-El formulario puede utilizar directamente la Hosted Feature Layer creada anteriormente.
-
-El flujo básico es:
-
-1. Abrir **Survey123 Connect** o el diseñador web.
-2. Crear un nuevo formulario.
-3. Seleccionar la Hosted Feature Layer existente.
-4. Mapear las preguntas con los campos de la capa.
-5. Publicar el formulario.
-
-Para este ejemplo se pueden utilizar campos como:
-
-```text
-name
-address
-city
-phone
-email
-```
-
-Survey123 obtiene automáticamente la geometría GPS cuando el formulario se configura para capturar la ubicación.
-
-Cada respuesta genera una nueva entidad en la Hosted Feature Layer.
-
-Como inicialmente esa entidad no tiene:
-
-```text
-odoo_partner_id
-```
-
-la siguiente ejecución de `run_reverse_sync()` la identifica como un nuevo registro y puede crear la información correspondiente en Odoo.
-
-Esto puede ejecutarse mediante polling o de forma manual con:
-
-```text
-POST /sync/reverse
-```
-
----
-
-# 7. Visualización con Dashboard / Experience Builder
-
-Una vez que Odoo y ArcGIS comparten la misma capa, se puede utilizar esa información directamente para construir una interfaz de consulta.
-
-No se requiere código adicional para esta parte.
-
-Desde ArcGIS:
-
-1. Crear un **Web Map** utilizando la Hosted Feature Layer.
-2. Simbolizar las entidades según el campo `status`.
-3. Crear un elemento de tipo **Dashboard** o **Experience Builder**.
-4. Añadir componentes como:
-   - mapa;
-   - lista de entidades;
-   - tabla;
-   - conteos por estado;
-   - filtros.
-
-La misma aplicación puede mostrar tanto las solicitudes originadas en Odoo como aquellas capturadas desde Survey123.
-
-Esto permite utilizar ArcGIS como la vista geográfica y de seguimiento de un proceso cuyo sistema de gestión principal continúa siendo Odoo.
-
----
-
-# 8. ArcGIS Online frente a ArcGIS Enterprise
-
-La Integration API está diseñada para trabajar con ambos entornos.
-
-| Aspecto | ArcGIS Online | ArcGIS Enterprise |
+| Método | Ruta | Qué hace |
 |---|---|---|
-| `ARCGIS_URL` | `https://www.arcgis.com` | URL del Portal mediante Web Adaptor |
-| MFA | App Authentication | Depende de la configuración del Portal |
-| Certificados | Administrados por Esri | Administrados por la organización |
-| Webhooks de capas | Disponibles según configuración | Dependen de versión y componentes |
-| Publicación | Hosting administrado por ArcGIS Online | Requiere un Hosting Server configurado |
-
-La lógica de `arcgis_client.py` no cambia entre ambos escenarios.
-
-La diferencia principal se maneja mediante la configuración de:
-
-```text
-ARCGIS_URL
-```
-
-y las credenciales utilizadas.
-
-En Enterprise también es importante considerar la configuración de certificados y la disponibilidad de un **federated Hosting Server** para publicar Hosted Feature Layers.
+| `GET` | `/health` | healthcheck |
+| `POST` | `/sync/run` | fuerza Odoo → ArcGIS |
+| `GET` | `/sync/last` | último resultado de `/sync/run` |
+| `POST` | `/sync/reverse` | fuerza ArcGIS → Odoo (features sin vincular) |
+| `GET` | `/sync/reverse/last` | último resultado de `/sync/reverse` |
+| `POST` | `/sync/reconcile` | fuerza la reconciliación (borra huérfanos en ArcGIS) |
+| `GET` | `/sync/reconcile/last` | último resultado de la reconciliación |
+| `POST` | `/webhook/arcgis` | aplica un cambio de estado recibido desde ArcGIS (real o simulado con `curl`) |
+| `POST` | `/webhook/odoo` | disparado por la Automation Rule de Odoo; corre `run_sync()` |
 
 ---
 
-# 9. Seguridad
+## 9. Survey123 / XLSForm
 
-Este proyecto está pensado como una referencia técnica y de demostración. Para un entorno productivo deben añadirse controles adicionales.
+El archivo `Survey_Odoo.xlsx` (entregado en esta sesión) es el XLSForm
+listo para importar en Survey123 Connect, apuntando a la misma Hosted
+Feature Layer que usa esta integración.
 
-Algunas consideraciones importantes:
+### 9.1. Lección: pegar por nombre de columna, no por posición
 
-### Variables de entorno
+Si conectas Survey123 Connect a una capa existente ("Advanced" /
+generar formulario desde capa), Survey123 genera su **propio** template
+con muchas más columnas reservadas que un XLSForm mínimo
+(`guidance_hint`, `required_message`, `readonly`, `calculation`,
+`bind::esri:fieldType`, `bind::esri:fieldAlias`, etc.) y en un **orden
+distinto** al de un XLSForm genérico. Pegar datos de otra fuente
+asumiendo el mismo orden de columnas produce dos problemas a la vez:
 
-Los archivos `.env` reales no deben subirse al repositorio.
+1. Un header duplicado real si la fuente trae su propia columna
+   `instance_name` además de la que Survey123 ya generó (error
+   *"Duplicate column header: instance_name"*).
+2. Valores en la columna equivocada (ej. "yes"/"no" cayendo en
+   `guidance_hint` en vez de `required`) aunque no haya error de
+   importación — el formulario "funciona" pero mal.
 
-El `.gitignore` ayuda a evitar commits accidentales, pero no protege frente a compartir manualmente el archivo, incluirlo en una captura o enviarlo por otro medio.
+**Regla:** siempre mapear por **nombre de columna del header real**,
+nunca por posición, al combinar datos de dos XLSForms distintos.
 
-### Client Secret
-
-El:
-
-```text
-ARCGIS_CLIENT_SECRET
-```
-
-debe tratarse como una contraseña.
-
-No debe aparecer en:
-
-- Git;
-- README;
-- logs;
-- capturas de pantalla;
-- archivos de configuración compartidos.
-
-### Permisos de la aplicación
-
-La aplicación debe tener únicamente acceso a los elementos que realmente necesita.
-
-Para este proyecto basta con dar acceso específico a la Hosted Feature Layer.
-
-Los privilegios de servicios de ubicación que no se utilizan pueden permanecer deshabilitados.
-
-### Certificados
-
-La opción:
-
-```text
-ARCGIS_VERIFY_CERT=False
-```
-
-puede ser útil en un laboratorio cuando Enterprise utiliza certificados autofirmados.
-
-No debería utilizarse como configuración permanente en producción.
-
-Desactivar la verificación de certificados puede permitir ataques de tipo **man-in-the-middle** si el tráfico atraviesa redes no confiables.
-
-### Credenciales de Odoo
-
-La contraseña del administrador de Odoo no debería reutilizarse como contraseña para la cuenta utilizada por la Integration API.
-
-Para producción es preferible utilizar una cuenta de servicio con los permisos estrictamente necesarios.
-
-### Webhooks
-
-Los endpoints:
-
-```text
-/webhook/arcgis
-/webhook/odoo
-```
-
-no deberían quedar expuestos públicamente sin algún mecanismo adicional de protección.
-
-Algunas alternativas son:
-
-- shared secret;
-- autenticación;
-- restricción por origen;
-- mTLS;
-- reverse proxy con controles de acceso.
-
----
-
-# 10. Solución de problemas
-
-## La Integration API no inicia
-
-Revisar primero los logs:
+### 9.2. Validación local
 
 ```bash
-docker compose logs -f integration-api
+pip install pyxform --break-system-packages
+python3 -m pyxform.xls2xform Survey_Odoo.xlsx test_output.xml
 ```
 
-Una causa frecuente es que falte el archivo `.env` o que no esté definido:
-
-```text
-ARCGIS_FEATURE_LAYER_ITEM_ID
-```
+Si no tira error, el XLSForm es válido (aunque Survey123 Connect puede
+ser ligeramente más estricto/distinto en algunos casos — es un
+stand-in, no un reemplazo de probar la importación real).
 
 ---
 
-## ArcGIS devuelve `Invalid username/password`
+## 10. Troubleshooting — bugs ya encontrados y corregidos
 
-Si las credenciales son correctas pero ArcGIS rechaza el inicio de sesión, revisa si la organización utiliza:
-
-- MFA;
-- SSO;
-- autenticación corporativa.
-
-En estos casos se debe utilizar App Authentication:
-
-```text
-ARCGIS_CLIENT_ID
-ARCGIS_CLIENT_SECRET
-```
+| Síntoma | Causa real | Fix |
+|---|---|---|
+| Coordenadas absurdas (`lat ≈ -20000`, `lon ≈ -8700000`) en tareas creadas desde Survey123 | `layer.query()` sin `out_sr` devuelve geometría en la referencia espacial nativa de almacenamiento (Web Mercator/3857), no en grados | `out_sr=4326` explícito en `get_unlinked_features()` |
+| Contacto se llama igual que la descripción del problema ("Robo") | `create_task_from_arcgis` usaba `name` (descripción) también para el contacto | usar `citizen_name` para el `res.partner`, `name` solo para el título de la tarea |
+| `status` vacío en ArcGIS para tareas creadas vía Survey123 hasta el siguiente ciclo | `set_odoo_id()` solo escribía el vínculo, no el status | `link_new_feature()` escribe vínculo + status inicial en una sola llamada, en la misma pasada de `run_reverse_sync` |
+| Tareas duplicadas en Odoo por una misma feature | corridas de `run_reverse_sync` solapadas sin protección | patrón claim/release con valor centinela |
+| Features en ArcGIS con `odoo_partner_id` apuntando a una tarea ya borrada | nada limpiaba referencias huérfanas | `run_reconciliation()` + endpoints `/sync/reconcile*` |
+| "El fix no funciona" tras editar código y correr `--force-recreate` | recrea el contenedor desde la imagen cacheada, no reconstruye la imagen | usar siempre `--build --force-recreate` tras editar código |
+| *"Duplicate column header: instance_name"* al importar el XLSForm | se pegaron datos en el template propio de Survey123 (que ya tenía su columna `instance_name`) asumiendo el orden de columnas de otro XLSForm | reconstruir el archivo mapeando cada valor por nombre de columna del header real, no por posición |
+| Conteo de tareas no coincide entre Odoo y ArcGIS | falso positivo: filtro "Open Tasks" activo en la vista Kanban de Odoo ocultaba una tarea en estado Cancelado | quitar el filtro; no es un bug de sincronización |
 
 ---
 
-## `NameResolutionError` con ArcGIS Enterprise
-
-Si el hostname de Enterprise funciona desde Windows, pero no desde el contenedor, puede tratarse de un nombre `.local` resuelto mediante mDNS/LLMNR.
-
-El contenedor puede necesitar una entrada como:
-
-```yaml
-extra_hosts:
-  - "host:host-gateway"
-```
-
-La solución concreta depende de cómo esté publicado el Portal dentro de la red.
-
----
-
-## `SSLCertVerificationError`
-
-Cuando Enterprise utiliza un certificado autofirmado, Python puede rechazar la conexión.
-
-Para un laboratorio controlado se puede utilizar:
-
-```text
-ARCGIS_VERIFY_CERT=False
-```
-
-No se recomienda mantener esta configuración en producción.
-
----
-
-## No se encuentra `OBJECTID`
-
-La publicación de la capa puede producir diferentes variantes del nombre del campo.
-
-El cliente intenta detectar dinámicamente:
-
-```text
-OBJECTID
-```
-
-o:
-
-```text
-objectid
-```
-
-Si continúa fallando, revisa la estructura de la Hosted Feature Layer desde:
-
-**Layer → Data**
-
----
-
-## `This operation is not supported` — Error 400
-
-Si `/sync/run` devuelve:
-
-```text
-This operation is not supported
-```
-
-normalmente la capa no tiene habilitada la edición.
-
-Revisa:
-
-**Settings → Editing options**
-
-y habilita:
-
-```text
-Enable editing
-```
-
-con permisos para:
-
-```text
-Add
-Update
-```
-
-Además, comprueba que la aplicación tenga acceso al elemento.
-
----
-
-## La sincronización inversa no crea registros
-
-Comprueba primero que las entidades nuevas tengan:
-
-```text
-odoo_partner_id IS NULL
-```
-
-El flujo inverso utiliza ese campo para distinguir las entidades que todavía no han sido enviadas a Odoo.
-
----
-
-## No se puede crear el webhook
-
-Para determinados webhooks de Feature Layer es necesario activar:
-
-```text
-Keep track of changes to data
-```
-
-desde:
-
-**Settings → Editing**
-
-Activa el seguimiento de cambios y vuelve a intentar crear el webhook.
-
----
-
-## El webhook recibe el estado pero la tarea no cambia
-
-El valor enviado en:
-
-```text
-new_status
-```
-
-debe coincidir exactamente con el nombre de una etapa existente en Odoo.
-
-Por ejemplo:
-
-```text
-Approved
-```
-
-no es equivalente a:
-
-```text
-approved
-```
-
-ni a:
-
-```text
-Aprobado
-```
-
-si la etapa configurada en Odoo tiene otro nombre.
-
----
-
-## Odoo deja de aceptar la contraseña
-
-Los datos de PostgreSQL se mantienen en el volumen:
-
-```text
-odoo-db-data
-```
-
-Por este motivo, cambiar las variables del `.env` no modifica automáticamente las credenciales que ya fueron almacenadas en una base existente.
-
-Después de modificar el archivo de configuración se puede intentar:
-
-```bash
-docker compose up -d --force-recreate db odoo
-```
-
-Si la base todavía no es necesaria y el problema persiste, una alternativa es eliminar el volumen y crear nuevamente el entorno.
-
-**Esto elimina los datos almacenados en la base de Odoo**, por lo que solamente debe hacerse en un entorno de demostración.
-
----
-
-## Comandos de diagnóstico
-
-Estos comandos permiten revisar rápidamente el estado de los servicios:
-
-```bash
-docker compose ps
-```
-
-Logs de la API:
-
-```bash
-docker compose logs -f integration-api
-```
-
-Estado del servicio:
-
-```bash
-curl -s http://localhost:8000/health
-```
-
-Última sincronización Odoo → ArcGIS:
-
-```bash
-curl -s http://localhost:8000/sync/last
-```
-
-Última sincronización ArcGIS → Odoo:
-
-```bash
-curl -s http://localhost:8000/sync/reverse/last
-```
-
----
-
-# 11. Consideraciones para producción
-
-El proyecto está pensado como una implementación de referencia y demostración. Para llevarlo a un entorno productivo, sería conveniente revisar al menos los siguientes puntos.
-
-### 1. Modelo de negocio
-
-En lugar de utilizar directamente `project.task`, se podría crear un módulo específico para las solicitudes ciudadanas.
-
-Esto permitiría incorporar funcionalidades como:
-
-- SLA;
-- asignación de responsables;
-- cuadrillas;
-- archivos adjuntos;
-- categorías;
-- prioridades;
-- historial;
-- reglas de negocio específicas.
-
-### 2. Webhooks nativos
-
-El proyecto utiliza un payload simplificado para facilitar las pruebas.
-
-En producción debería implementarse un adaptador como:
-
-```python
-adapt_agol_payload()
-```
-
-que transforme el payload real enviado por ArcGIS al modelo utilizado internamente por la API.
-
-### 3. Certificados
-
-Los entornos Enterprise productivos deberían utilizar certificados válidos y confiables.
-
-La configuración:
-
-```text
-ARCGIS_VERIFY_CERT=False
-```
-
-debe eliminarse.
-
-### 4. Protección de endpoints
-
-Los endpoints `/webhook/*` deberían estar protegidos mediante mecanismos de autenticación o controles de red.
-
-Dependiendo de la arquitectura, pueden utilizarse:
-
-- shared secrets;
-- mTLS;
-- reverse proxy;
-- restricciones de red;
-- autenticación basada en tokens.
-
-### 5. Volumen de información
-
-Para volúmenes pequeños, el polling resulta suficiente para este ejemplo.
-
-Si el número de registros aumenta considerablemente, conviene revisar:
-
-- procesamiento por lotes;
-- uso de `edit_features`;
-- idempotencia;
-- paginación;
-- control de errores;
-- reintentos.
-
-### 6. Colas de mensajes
-
-Si el volumen de eventos crece, una arquitectura basada únicamente en polling puede dejar de ser adecuada.
-
-En ese escenario se puede incorporar una cola como:
-
-```text
-RabbitMQ
-```
-
-o:
-
-```text
-Redis
-```
-
-para desacoplar la recepción de eventos del procesamiento.
-
-### 7. Observabilidad
-
-En producción también sería recomendable centralizar:
-
-- logs;
-- métricas;
-- errores;
-- tiempos de ejecución;
-- número de registros procesados;
-- fallos de sincronización;
-- reintentos.
-
----
-
-# 12. Alcance y licenciamiento
-
-Este repositorio funciona como una **referencia técnica para una prueba de concepto**.
-
-No constituye una implementación certificada para producción ni incluye garantías sobre configuraciones específicas de Odoo, ArcGIS Online o ArcGIS Enterprise.
-
-Antes de utilizar la arquitectura en un entorno productivo se deben validar las condiciones de licenciamiento y las capacidades disponibles en la versión concreta de ArcGIS Online / ArcGIS Enterprise.
-
-El ejemplo utiliza **Odoo Community**, bajo licencia LGPL.
-
-Las funcionalidades de ArcGIS utilizadas en el proyecto pueden requerir licenciamiento o capacidades específicas dependiendo de si la implementación se realiza en ArcGIS Online o ArcGIS Enterprise.
-
----
-
-## Flujo completo resumido
-
-El flujo principal puede entenderse de la siguiente manera:
-
-```text
-                     ┌──────────────────────┐
-                     │        Odoo          │
-                     │                      │
-                     │  Ciudadano           │
-                     │       ↓              │
-                     │  Solicitud           │
-                     │   project.task       │
-                     └──────────┬───────────┘
-                                │
-                                │ XML-RPC
-                                ▼
-                     ┌──────────────────────┐
-                     │  Integration API     │
-                     │                      │
-                     │  /sync/run           │
-                     │  /sync/reverse       │
-                     │  /webhook/odoo       │
-                     │  /webhook/arcgis     │
-                     └──────────┬───────────┘
-                                │
-                                │ ArcGIS API
-                                ▼
-                  ┌────────────────────────────┐
-                  │   Hosted Feature Layer     │
-                  │                            │
-                  │  Solicitudes geográficas   │
-                  └─────────────┬──────────────┘
-                                │
-                  ┌─────────────┴──────────────┐
-                  │                            │
-                  ▼                            ▼
-        ┌──────────────────┐        ┌─────────────────────┐
-        │    Survey123     │        │ Dashboard /         │
-        │                  │        │ Experience Builder  │
-        │ Captura en campo │        │                     │
-        └──────────────────┘        │ Consulta y análisis │
-                                    └─────────────────────┘
-```
-
-De esta manera, **Odoo mantiene la gestión operativa de las solicitudes**, mientras que **ArcGIS incorpora el componente geográfico, la captura en campo y la visualización espacial**. La Integration API actúa como punto de enlace entre ambos sistemas y mantiene la información sincronizada en las dos direcciones.
+## 11. Seguridad
+
+- Nunca commitear `.env`.
+- Rotar toda credencial (Odoo, ArcGIS) que haya sido compartida en texto
+  plano durante el desarrollo/pruebas de esta demo, antes de mostrarla a
+  un municipio real.
+- Preferir **App Authentication (OAuth client credentials)** en ArcGIS
+  sobre usuario/contraseña para el microservicio.
+- El usuario técnico de Odoo debe tener el mínimo de permisos necesarios
+  (acceso a `project.task` y `res.partner` del proyecto en cuestión).
