@@ -29,6 +29,12 @@ Propiedad de cada dato (quién manda):
   Observaciones y fotos -> campo (van a Odoo como notas/adjuntos).
 - Frentes: nombre, tipo, responsable, fechas y trazado -> campo.
   Estado -> compartido. Asignación de solicitudes -> calculada.
+
+Autoría en Odoo: lo hecho en campo lo firma el usuario de ArcGIS que lo hizo
+(Creator / Editor de la capa): su usuario de Odoo si coincide (o está en
+ARCGIS_ODOO_USERS), si no un contacto con su nombre. Los reportes anónimos de
+Survey123 los firma el ciudadano; lo que calcula la integración (asignaciones,
+ajustes), el contacto "Integración ArcGIS".
 """
 
 from __future__ import annotations
@@ -43,7 +49,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from app import geo
-from app.arcgis_client import ArcGISLayer, CLAIM_SENTINEL, ODOO_ID_FIELD, SKIP, coerce_value
+from app.arcgis_client import (ArcGISLayer, CLAIM_SENTINEL, ODOO_ID_FIELD, SKIP, coerce_value,
+                               user_profile)
 from app.config import settings
 from app.odoo_client import FRONT_TAG_PREFIX, OdooClient
 from app.schemas import LayerCounts, PipelineSummary
@@ -76,6 +83,11 @@ _TAG_RE = re.compile(rf"^{re.escape(FRONT_TAG_PREFIX)}(\d+)\b")
 _run_lock = threading.Lock()
 _last_summary: PipelineSummary | None = None
 _warned: set[str] = set()
+
+# Estado de UNA pasada (se reinicia en _run):
+_authors: dict[str, dict] = {}                  # usuario ArcGIS (minúsculas) -> autor en Odoo
+_pass_editors: dict[tuple[str, int], str] = {}  # (capa, oid) -> editor ANTES de que escribamos
+_pass_authors: dict[tuple[str, int], dict] = {} # (capa, oid) -> autor de un registro creado ahora
 
 
 # =============================================================== helpers ===
@@ -146,8 +158,40 @@ def _creator(layer: ArcGISLayer, feature: dict) -> str | None:
     return (feature.get(field) if field else None) or _editor(layer, feature)
 
 
-def _by(editor: str | None) -> str:
-    return f" (por {_esc(editor)})" if editor else ""
+def _field_user(value: Any) -> str | None:
+    user = _norm(value)
+    return user if isinstance(user, str) and user else None
+
+
+def _system_author() -> dict:
+    """Firma de lo que hace la propia integración (asignaciones, ajustes)."""
+    if "" not in _authors:
+        _authors[""] = odoo.system_author()
+    return _authors[""]
+
+
+def _remember_editor(layer: ArcGISLayer, f: dict) -> None:
+    """Editor de la feature tal como la dejó el campo, antes de que la pasada escriba en ella."""
+    editor = _field_user(_editor(layer, f))
+    if editor:
+        _pass_editors[(layer.key, f["_oid"])] = editor
+
+
+def _author(username: Any) -> dict:
+    """
+    Quién firma en Odoo un cambio hecho en campo: el usuario de ArcGIS que lo
+    hizo (su usuario de Odoo o un contacto con su nombre). Sin usuario (p. ej.
+    una edición anónima): la integración.
+    """
+    user = _field_user(username)
+    if not user:
+        return _system_author()
+    key = user.lower()
+    if key not in _authors:
+        full_name, email = user_profile(user)
+        _authors[key] = odoo.author_for_arcgis_user(
+            user, full_name, email, settings.arcgis_odoo_user_map().get(key))
+    return _authors[key]
 
 
 def _date_value(value: Any) -> datetime | None:
@@ -248,9 +292,11 @@ def _merge_status(layer: ArcGISLayer, f: dict, task_id: int, odoo_label: str,
             # texto libre si la capa no tiene dominio): se revierte.
             c.rejected_field_values += 1
             if arc:
-                odoo.post_note(task_id, f"<p>El estado <b>{_esc(arc)}</b> escrito en campo"
-                                        f"{_by(_editor(layer, f))} no es válido en Odoo; "
-                                        f"se mantiene <b>{_esc(odo)}</b>.</p>")
+                editor = _field_user(_editor(layer, f))
+                who = f" por {_esc(_author(editor)['name'])}" if editor else ""
+                odoo.post_note(task_id, f"<p>El estado <b>{_esc(arc)}</b> escrito en campo{who} "
+                                        f"no es válido en Odoo; se mantiene <b>{_esc(odo)}</b>.</p>",
+                               author=_system_author())
             _set(upd, layer, f, F_STATUS, odo)
             _set(upd, layer, f, F_SYNC_STATUS, odo)
             return
@@ -258,8 +304,8 @@ def _merge_status(layer: ArcGISLayer, f: dict, task_id: int, odoo_label: str,
         c.updated_in_odoo += 1
         if decision == "conflict_arcgis":
             c.conflicts += 1
-        odoo.post_note(task_id, f"<p>Estado actualizado en campo: <b>{_esc(arc)}</b>"
-                                f"{_by(_editor(layer, f))}</p>")
+        odoo.post_note(task_id, f"<p>Estado actualizado en campo: <b>{_esc(odo)} → {_esc(arc)}</b></p>",
+                       author=_author(_editor(layer, f)))
         _set(upd, layer, f, F_SYNC_STATUS, arc)
         return
     # to_arcgis / conflict_odoo
@@ -279,8 +325,8 @@ def _merge_observations(layer: ArcGISLayer, f: dict, task_id: int, upd: dict,
     if fp == _norm(f.get(F_SYNC_OBS)):
         return
     if text:
-        odoo.post_note(task_id, f"<p><b>Observación de campo</b>{_by(_editor(layer, f))}:</p>"
-                                f"<p>{_esc(text)}</p>")
+        odoo.post_note(task_id, f"<p><b>Observación de campo:</b></p><p>{_esc(text)}</p>",
+                       author=_author(_editor(layer, f)))
         c.notes_posted += 1
     _set(upd, layer, f, F_SYNC_OBS, fp)
 
@@ -332,20 +378,28 @@ def _reverse_requests(c: LayerCounts, errors: list[str]) -> None:
             continue
         task_id = None
         try:
-            task_id = odoo.create_task_from_arcgis(rec, settings.odoo_project_name)
+            creator = _field_user(_creator(layer, rec))
+            # Reporte de un usuario de ArcGIS (Field Maps, o Survey123 con sesión)
+            # sin nombre de ciudadano: el contacto lleva el nombre de ese usuario.
+            contact_name = (f"{_author(creator)['name']} (reporte de campo)"
+                            if creator and not _norm(rec.get("citizen_name")) else None)
+            task_id, contact = odoo.create_task_from_arcgis(rec, settings.odoo_project_name,
+                                                            contact_name)
             status = _initial_status(task_id, rec)
             attrs: dict[str, Any] = {layer.id_field: task_id, F_STATUS: status,
                                      F_SYNC_STATUS: status}
             if geo.valid_latlon(rec["_lat"], rec["_lon"]):
                 attrs.update({F_SYNC_GEOM: geo.point_fp(rec["_lat"], rec["_lon"]),
                               F_LAT: rec["_lat"], F_LON: rec["_lon"]})
-            editor = _creator(layer, rec)
-            odoo.post_note(task_id, f"<p>Solicitud creada desde campo (ArcGIS){_by(editor)}.</p>"
-                                    + _map_links(rec["_lat"], rec["_lon"]))
+            # Firma: el usuario de ArcGIS; un reporte anónimo de Survey123, el ciudadano.
+            author = _author(creator) if creator else contact
+            _pass_authors[(layer.key, oid)] = author     # también firma sus fotos
+            odoo.post_creation(task_id, "<p>Solicitud registrada en campo (ArcGIS).</p>"
+                                        + _map_links(rec["_lat"], rec["_lon"]), author=author)
             text = _norm(rec.get(F_OBS))
             if text and layer.has_field(F_SYNC_OBS):
-                odoo.post_note(task_id, f"<p><b>Observación de campo</b>{_by(editor)}:</p>"
-                                        f"<p>{_esc(text)}</p>")
+                odoo.post_note(task_id, f"<p><b>Observación de campo:</b></p><p>{_esc(text)}</p>",
+                               author=author)
                 c.notes_posted += 1
                 attrs[F_SYNC_OBS] = geo.text_fp(text)
             _link(layer, oid, task_id, attrs)
@@ -381,12 +435,14 @@ def _front_task_vals(f: dict) -> tuple[dict[str, Any], float]:
     length = geo.polyline_length_m(f.get("_geom"))
     mid = geo.polyline_midpoint(f.get("_geom"))
     start, end = _date_value(content["inicio"]), _date_value(content["fin"])
+    creator = _field_user(_creator(fronts_layer, f))
     rows = [
         ("Tipo de trabajo", content["tipo"]),
         ("Responsable", content["responsable"]),
         ("Longitud", f"{length:,.0f} m".replace(",", ".")),
         ("Inicio", start.strftime("%d/%m/%Y") if start else ""),
         ("Fin previsto", end.strftime("%d/%m/%Y") if end else ""),
+        ("Registrado en campo por", _author(creator)["name"] if creator else ""),
     ]
     items = "".join(f"<li><b>{k}:</b> {_esc(v)}</li>" for k, v in rows if v)
     description = (f"<ul>{items}</ul>"
@@ -413,6 +469,8 @@ def _reverse_fronts(c: LayerCounts, errors: list[str]) -> None:
             continue
         task_id = None
         try:
+            author = _author(_creator(layer, rec))
+            _pass_authors[(layer.key, oid)] = author     # también firma sus fotos
             vals, length = _front_task_vals(rec)
             task_id = odoo.create_workfront_task(settings.odoo_workfront_project_name, vals)
             status = _initial_status(task_id, rec)
@@ -420,12 +478,12 @@ def _reverse_fronts(c: LayerCounts, errors: list[str]) -> None:
                 layer.id_field: task_id, F_STATUS: status, F_SYNC_STATUS: status,
                 F_SYNC_FP: geo.content_fp(_front_content(rec)), F_LONGITUD: round(length, 1),
             }
-            editor = _creator(layer, rec)
-            odoo.post_note(task_id, f"<p>Frente de trabajo dibujado en campo{_by(editor)}.</p>")
+            odoo.post_creation(task_id, "<p>Frente de trabajo dibujado en ArcGIS Field Maps.</p>",
+                               author=author)
             text = _norm(rec.get(F_OBS))
             if text and layer.has_field(F_SYNC_OBS):
-                odoo.post_note(task_id, f"<p><b>Observación de campo</b>{_by(editor)}:</p>"
-                                        f"<p>{_esc(text)}</p>")
+                odoo.post_note(task_id, f"<p><b>Observación de campo:</b></p><p>{_esc(text)}</p>",
+                               author=author)
                 c.notes_posted += 1
                 attrs[F_SYNC_OBS] = geo.text_fp(text)
             _link(layer, oid, task_id, attrs)
@@ -468,10 +526,13 @@ def _merge_request_location(layer: ArcGISLayer, f: dict, t: dict,
             c.updated_in_odoo += 1
             if decision == "conflict_arcgis":
                 c.conflicts += 1
-            what = ("Ubicación tomada del mapa (Odoo no tenía coordenadas válidas)"
-                    if odo is None else f"Ubicación corregida en campo{_by(_editor(layer, f))}")
+            if odo is None:
+                what, author = ("Ubicación tomada del mapa (Odoo no tenía coordenadas válidas)",
+                                _system_author())
+            else:
+                what, author = "Ubicación corregida en campo", _author(_editor(layer, f))
             odoo.post_note(t["task_id"], f"<p>{what}: {arc[0]:.6f}, {arc[1]:.6f}</p>"
-                                         + _map_links(*arc))
+                                         + _map_links(*arc), author=author)
     elif decision in ("to_arcgis", "conflict_odoo"):
         if decision == "conflict_odoo":
             c.conflicts += 1
@@ -512,6 +573,7 @@ def _merge_requests(c: LayerCounts, errors: list[str]) -> None:
     features: dict[int, dict] = {}
     for f in layer.linked_features():
         features.setdefault(f[layer.id_field], f)
+        _remember_editor(layer, f)
 
     updates, adds = [], []
     for t in tasks:
@@ -554,6 +616,7 @@ def _merge_fronts(c: LayerCounts, errors: list[str]) -> None:
     tasks = {t["task_id"]: t for t in odoo.get_workfront_tasks(settings.odoo_workfront_project_name)}
     updates = []
     for f in layer.linked_features():
+        _remember_editor(layer, f)
         t = tasks.get(f[layer.id_field])
         if t is None:
             continue  # la reconciliación decide
@@ -564,7 +627,13 @@ def _merge_fronts(c: LayerCounts, errors: list[str]) -> None:
                 fp = geo.content_fp(_front_content(f))
                 if fp != _norm(f.get(F_SYNC_FP)):
                     vals, length = _front_task_vals(f)
-                    odoo.update_task(t["task_id"], vals)
+                    # Sin seguimiento: el cambio lo firma la nota de quien editó.
+                    odoo.update_task(t["task_id"], vals, tracking=False)
+                    meters = f"{length:,.0f}".replace(",", ".")
+                    odoo.post_note(t["task_id"],
+                                   f"<p>Frente actualizado en campo: <b>{_esc(vals['name'])}</b> "
+                                   f"({meters} m)</p>",
+                                   author=_author(_editor(layer, f)))
                     c.updated_in_odoo += 1
                     _set(upd, layer, f, F_SYNC_FP, fp)
                     _set(upd, layer, f, F_LONGITUD, round(length, 1))
@@ -715,7 +784,7 @@ def _assign(c_req: LayerCounts, c_fr: LayerCounts, errors: list[str]) -> int:
         if removed:
             body += f"<p>Retiradas: {fmt(removed)}</p>"
         try:
-            odoo.post_note(ftid, body)
+            odoo.post_note(ftid, body, author=_system_author())
         except Exception as exc:  # noqa: BLE001
             errors.append(f"nota frente {ftid}: {exc}")
 
@@ -731,9 +800,19 @@ def _sync_attachments(layer: ArcGISLayer, c: LayerCounts, errors: list[str]) -> 
     rows = layer.linked_attachments()
     if not rows:
         return
-    linked = {f["_oid"]: f[layer.id_field] for f in layer.query(
-        f"{layer.id_field} > 0", out_fields=[layer.oid_field(), layer.id_field],
-        return_geometry=False)}
+    editor_field = layer.edit_fields()["editor"]
+    out_fields = [layer.oid_field(), layer.id_field] + ([editor_field] if editor_field else [])
+    parents = layer.query(f"{layer.id_field} > 0", out_fields=out_fields, return_geometry=False)
+    linked = {f["_oid"]: f[layer.id_field] for f in parents}
+    # Quién agregó la foto: quien creó el registro (si se creó en esta pasada),
+    # o el editor de la feature ANTES de que la pasada escribiera en ella, o
+    # su editor actual.
+    current = {f["_oid"]: f.get(editor_field) if editor_field else None for f in parents}
+
+    def photo_author(oid: int) -> dict:
+        key = (layer.key, oid)
+        return _pass_authors.get(key) or _author(_pass_editors.get(key) or current.get(oid))
+
     synced = odoo.synced_attachment_keys({linked[r["parent_oid"]] for r in rows
                                           if r["parent_oid"] in linked})
     for r in rows:
@@ -753,7 +832,7 @@ def _sync_attachments(layer: ArcGISLayer, c: LayerCounts, errors: list[str]) -> 
             att_id = odoo.attach_file(task_id, r.get("name") or name, data,
                                       r.get("content_type"), key)
             odoo.post_note(task_id, f"<p><b>Adjunto de campo</b>: {_esc(r.get('name') or name)}</p>",
-                           attachment_ids=[att_id])
+                           attachment_ids=[att_id], author=photo_author(r["parent_oid"]))
             c.photos_synced += 1
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{layer.key} adjunto {r.get('name')}: {exc}")
@@ -788,6 +867,9 @@ def _run(reason: str, steps: tuple[str, ...]) -> PipelineSummary:
     req_c, fr_c = LayerCounts(), LayerCounts()
     errors: list[str] = []
     assignment_changes = 0
+    _authors.clear()        # autores y editores se resuelven de nuevo en cada pasada
+    _pass_editors.clear()
+    _pass_authors.clear()
 
     if not requests_layer.configured:
         errors.append("ARCGIS_FEATURE_LAYER_ITEM_ID no está configurado.")
@@ -844,50 +926,91 @@ def get_last_summary() -> PipelineSummary | None:
 
 # ============================================================== runner =====
 
+def _recheck_delays() -> list[float]:
+    """WEBHOOK_RECHECK_SECONDS="10,30,60" -> [10.0, 30.0, 60.0]."""
+    delays = []
+    for part in str(settings.webhook_recheck_seconds or "").split(","):
+        try:
+            value = float(part.strip())
+        except ValueError:
+            continue
+        if value > 0:
+            delays.append(value)
+    return sorted(delays)
+
+
 class _Runner:
     """
-    Recibe "timbrazos" (webhooks) y los agrupa: espera
-    WEBHOOK_DEBOUNCE_SECONDS, corre UNA pasada con todos los motivos
-    acumulados, y repite mientras sigan llegando. Así una ráfaga de 20
-    eventos produce 1-2 pasadas, no 20, y la espera deja que Odoo confirme
-    su transacción antes de que la leamos.
+    Recibe "timbrazos" (webhooks) y los convierte en pasadas:
+
+    - Agrupa: espera WEBHOOK_DEBOUNCE_SECONDS y corre UNA pasada con todos
+      los avisos acumulados (una ráfaga de 20 eventos = 1-2 pasadas). Esa
+      espera también deja que Odoo confirme su transacción antes de leerla.
+    - Re-chequea: ArcGIS Online puede enviar el webhook ANTES de que el
+      registro nuevo sea visible en las consultas. Tras un aviso de ArcGIS se
+      programan pasadas extra a los WEBHOOK_RECHECK_SECONDS (10, 30, 60 s):
+      el cambio se toma apenas ArcGIS lo muestra, sin esperar al scheduler.
+      Como la pasada es idempotente, un re-chequeo sin cambios no escribe nada.
     """
 
+    RECHECK = "re-chequeo tras webhook de ArcGIS"
+
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._cv = threading.Condition()
         self._pending: set[str] = set()
+        self._rechecks: list[float] = []        # instantes (time.monotonic)
         self._worker: threading.Thread | None = None
         self._busy = False
 
     def request(self, reason: str) -> None:
-        with self._lock:
+        with self._cv:
             self._pending.add(reason)
             if self._worker is None or not self._worker.is_alive():
                 self._worker = threading.Thread(target=self._loop, name="sync-runner", daemon=True)
                 self._worker.start()
+            self._cv.notify_all()
+
+    def _wait_for_work(self) -> bool:
+        """Espera un aviso o el próximo re-chequeo. False = no queda nada (fin del hilo)."""
+        with self._cv:
+            while not self._pending:
+                if not self._rechecks:
+                    self._worker = None
+                    return False
+                wait = self._rechecks[0] - time.monotonic()
+                if wait <= 0:
+                    self._rechecks.pop(0)
+                    self._pending.add(self.RECHECK)
+                    break
+                self._cv.wait(timeout=wait)
+            return True
 
     def _loop(self) -> None:
-        while True:
+        while self._wait_for_work():
             time.sleep(max(0.0, settings.webhook_debounce_seconds))
-            with self._lock:
-                if not self._pending:
-                    self._worker = None
-                    return
+            with self._cv:
                 reasons = sorted(self._pending)
                 self._pending.clear()
+                if any(r.startswith("arcgis:") for r in reasons):
+                    base = time.monotonic()
+                    self._rechecks = [base + d for d in _recheck_delays()]
                 self._busy = True
+            label = (self.RECHECK if reasons == [self.RECHECK]
+                     else "webhook: " + ", ".join(r for r in reasons if r != self.RECHECK))
             try:
-                run_pipeline(reason="webhook: " + ", ".join(reasons))
+                run_pipeline(reason=label)
             except Exception:  # noqa: BLE001
                 logger.exception("Falló la pasada disparada por webhook")
             finally:
-                with self._lock:
+                with self._cv:
                     self._busy = False
 
     def status(self) -> dict[str, Any]:
-        with self._lock:
-            return {"running": self._busy or _run_lock.locked(),
-                    "pending_reasons": sorted(self._pending)}
+        with self._cv:
+            pending = sorted(self._pending)
+            if self._rechecks:
+                pending.append(f"{len(self._rechecks)} re-chequeo(s) programado(s)")
+            return {"running": self._busy or _run_lock.locked(), "pending_reasons": pending}
 
 
 runner = _Runner()
@@ -910,5 +1033,6 @@ def handle_manual_status(odoo_task_id: int, new_status: str | None, note: str | 
                          f"se registra solo como nota.")
     if note:
         parts.append(_esc(note))
-    odoo.post_note(odoo_task_id, "<p>" + "<br/>".join(parts or ["Actualización recibida desde ArcGIS."]) + "</p>")
+    odoo.post_note(odoo_task_id, "<p>" + "<br/>".join(parts or ["Actualización recibida desde ArcGIS."])
+                   + "</p>", author=_system_author())
     runner.request("simulación /webhook/arcgis")

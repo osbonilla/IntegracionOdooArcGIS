@@ -20,12 +20,25 @@ Notas de Odoo 17/18 que este archivo respeta:
   body_is_html=True (Odoo lo registra con un warning inofensivo).
 - `04_waiting_normal` ("Waiting") lo calcula Odoo a partir de dependencias:
   no se escribe nunca desde la integración.
+
+Autoría: lo que llega de campo se firma con el usuario de ArcGIS que lo hizo
+(`author_id`), no con el usuario técnico de la integración. Para eso:
+- las tareas se crean con `mail_create_nolog` (sin el "Tarea creada" que
+  Odoo firmaría con el usuario técnico) y la integración publica ese mensaje
+  con el autor real;
+- los cambios de estado y de datos del frente se escriben con `mail_notrack`
+  y van acompañados de una nota firmada por quien los hizo en campo;
+- message_post exige que el autor tenga correo (si no, "Unable to send
+  message, please configure the sender's email address"): cuando el autor
+  no tiene, se envía `email_from` con su nombre y el correo del usuario
+  técnico.
 """
 
 from __future__ import annotations
 
 import base64
 import logging
+import re
 import xmlrpc.client
 from typing import Any, Iterable
 
@@ -38,6 +51,20 @@ NON_WRITABLE_STATES = {"04_waiting_normal"}
 CANCELLED_STATE = "1_canceled"
 FRONT_TAG_PREFIX = "Frente #"
 
+# Contextos de escritura: sin el mensaje automático de creación y sin el
+# seguimiento de cambios firmados por el usuario técnico (ver docstring).
+NO_CREATION_LOG = {"context": {"mail_create_nolog": True}}
+NO_TRACKING = {"context": {"mail_notrack": True}}
+
+SYSTEM_AUTHOR_REF = "arcgis:integracion"
+SYSTEM_AUTHOR_NAME = "Integración ArcGIS"
+_EMAIL_RE = re.compile(r"^[^@\s<>\"]+@[^@\s<>\"]+\.[^@\s<>\"]+$")
+
+
+def _like_literal(value: str) -> str:
+    """Valor para =ilike sin comodines (los usuarios de ArcGIS suelen llevar '_')."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
 
 class OdooClient:
     def __init__(self) -> None:
@@ -47,6 +74,7 @@ class OdooClient:
         self.password = settings.odoo_password
         self._uid: int | None = None
         self._state_label_map: dict[str, str] | None = None
+        self._own_email: str | None = None
 
     # ------------------------------------------------------------ base --
 
@@ -117,7 +145,8 @@ class OdooClient:
         return self.state_label(CANCELLED_STATE) or "Cancelled"
 
     def set_task_state_code(self, task_id: int, code: str) -> None:
-        self._execute("project.task", "write", [task_id], {"state": code})
+        # Sin seguimiento: el cambio lo firma la nota de quien lo hizo en campo.
+        self._execute("project.task", "write", [task_id], {"state": code}, **NO_TRACKING)
 
     def set_task_state_by_label(self, task_id: int, label: str) -> bool:
         code = self.state_code(label)
@@ -180,27 +209,33 @@ class OdooClient:
             })
         return results
 
-    def create_task_from_arcgis(self, record: dict, project_name: str) -> int:
+    def create_task_from_arcgis(self, record: dict, project_name: str,
+                                contact_name: str | None = None) -> tuple[int, dict]:
         """
         Crea contacto + tarea a partir de una feature nueva sin vincular
-        (Survey123 / Field Maps). El CONTACTO toma `citizen_name`; `name` es
-        la descripción del problema y va solo al título de la tarea.
+        (Survey123 / Field Maps). El CONTACTO toma `citizen_name` (o
+        `contact_name`, p. ej. el usuario de Field Maps que lo reportó); `name`
+        es la descripción del problema y va solo al título de la tarea.
+        Devuelve (task_id, contacto como autor) para firmar la creación.
         """
         project_id = self.get_or_create_project(project_name)
+        name = record.get("citizen_name") or contact_name or "Ciudadano (reporte de campo)"
+        email = record.get("email") or ""
         partner_id = self._execute("res.partner", "create", {
-            "name": record.get("citizen_name") or "Ciudadano (reporte de campo)",
+            "name": name,
             "street": record.get("address") or "",
             "city": record.get("city") or "",
             "phone": record.get("phone") or "",
-            "email": record.get("email") or "",
+            "email": email,
             "partner_latitude": record.get("_lat") or 0.0,
             "partner_longitude": record.get("_lon") or 0.0,
-        })
-        return self._execute("project.task", "create", {
+        }, **NO_CREATION_LOG)
+        task_id = self._execute("project.task", "create", {
             "name": record.get("name") or "Reporte de campo (ArcGIS)",
             "project_id": project_id,
             "partner_id": partner_id,
-        })
+        }, **NO_CREATION_LOG)
+        return task_id, {"partner_id": partner_id, "name": name, "email": email or None}
 
     def update_partner_location(self, partner_id: int, lat: float, lon: float) -> None:
         self._execute("res.partner", "write", [partner_id], {
@@ -227,28 +262,98 @@ class OdooClient:
 
     def create_workfront_task(self, project_name: str, vals: dict[str, Any]) -> int:
         project_id = self.get_or_create_project(project_name)
-        return self._execute("project.task", "create", {**vals, "project_id": project_id})
+        return self._execute("project.task", "create", {**vals, "project_id": project_id},
+                             **NO_CREATION_LOG)
 
-    def update_task(self, task_id: int, vals: dict[str, Any]) -> None:
-        self._execute("project.task", "write", [task_id], vals)
+    def update_task(self, task_id: int, vals: dict[str, Any], tracking: bool = True) -> None:
+        if tracking:
+            self._execute("project.task", "write", [task_id], vals)
+        else:
+            self._execute("project.task", "write", [task_id], vals, **NO_TRACKING)
+
+    # ------------------------------------------------------------- autores --
+
+    def _own_sender_email(self) -> str:
+        """Correo del usuario técnico: remitente cuando el autor no tiene correo."""
+        if self._own_email is None:
+            rows = self._execute("res.users", "read", [self.authenticate()], ["email"])
+            email = (rows[0].get("email") or "") if rows else ""
+            self._own_email = email if _EMAIL_RE.match(email) else "noreply@localhost"
+        return self._own_email
+
+    def _email_from(self, author: dict) -> str:
+        name = str(author.get("name") or "").replace('"', "'").replace("\\", "")
+        email = author.get("email") or ""
+        if not _EMAIL_RE.match(email):
+            email = self._own_sender_email()
+        return f'"{name}" <{email}>'
+
+    def _contact_by_ref(self, ref: str, name: str, email: str | None = None) -> dict:
+        """Contacto identificado por `ref`; se crea la primera vez. Si alguien lo
+        renombra en Odoo (p. ej. con el nombre completo), se respeta."""
+        rows = self._execute("res.partner", "search_read", [["ref", "=", ref]],
+                             ["id", "name", "email"], limit=1, order="id asc",
+                             context={"active_test": False})
+        if rows:
+            r = rows[0]
+            return {"partner_id": r["id"], "name": r["name"], "email": r.get("email") or None}
+        partner_id = self._execute("res.partner", "create", {
+            "name": name, "ref": ref, "email": email or False,
+            "comment": "<p>Usuario de ArcGIS (Field Maps / Survey123). Lo creó la "
+                       "integración para firmar en Odoo lo que este usuario hace en campo.</p>",
+        }, **NO_CREATION_LOG)
+        return {"partner_id": partner_id, "name": name, "email": email}
+
+    def author_for_arcgis_user(self, username: str, full_name: str | None = None,
+                               email: str | None = None, odoo_login: str | None = None) -> dict:
+        """
+        Autor en Odoo de lo que hizo un usuario de ArcGIS en campo:
+        1. el usuario interno de Odoo indicado en ARCGIS_ODOO_USERS, o cuyo
+           login o correo coincide con el usuario / correo de ArcGIS;
+        2. si no hay, un contacto "arcgis:<usuario>" con su nombre completo (si
+           ArcGIS lo entrega) o su nombre de usuario.
+        """
+        keys = [k for k in dict.fromkeys((odoo_login, username, email)) if k]
+        conditions = [[field, "=ilike", _like_literal(k)] for k in keys for field in ("login", "email")]
+        domain = ["&", ["share", "=", False]] + ["|"] * (len(conditions) - 1) + conditions
+        users = self._execute("res.users", "search_read", domain,
+                              ["partner_id", "name", "email"], limit=1, order="id asc")
+        if users:
+            u = users[0]
+            return {"partner_id": u["partner_id"][0], "name": u["name"], "email": u.get("email") or None}
+        return self._contact_by_ref(f"arcgis:{username}", full_name or username, email)
+
+    def system_author(self) -> dict:
+        """Autor de las notas que genera la propia integración (asignaciones, ajustes)."""
+        return self._contact_by_ref(SYSTEM_AUTHOR_REF, SYSTEM_AUTHOR_NAME)
 
     # ------------------------------------------------------------- notas --
 
+    def _post(self, task_id: int, author: dict | None, **kwargs: Any) -> int:
+        if author:
+            kwargs["author_id"] = author["partner_id"]
+            kwargs["email_from"] = self._email_from(author)
+        return self._execute("project.task", "message_post", task_id,
+                             body_is_html=True, **kwargs)
+
     def post_note(self, task_id: int, html_body: str,
-                  attachment_ids: Iterable[int] | None = None) -> int:
+                  attachment_ids: Iterable[int] | None = None,
+                  author: dict | None = None) -> int:
         """
-        Nota interna en el chatter. El HTML debe venir ya escapado en las
-        partes que provienen de usuarios (ver sync._esc).
+        Nota interna en el chatter, firmada por `author` (sin autor: el
+        usuario técnico). El HTML debe venir ya escapado en las partes que
+        provienen de usuarios (ver sync._esc).
         """
-        kwargs: dict[str, Any] = {
-            "body": html_body,
-            "body_is_html": True,
-            "message_type": "comment",
-            "subtype_xmlid": "mail.mt_note",
-        }
+        kwargs: dict[str, Any] = {"body": html_body, "message_type": "comment",
+                                  "subtype_xmlid": "mail.mt_note"}
         if attachment_ids:
             kwargs["attachment_ids"] = list(attachment_ids)
-        return self._execute("project.task", "message_post", task_id, **kwargs)
+        return self._post(task_id, author, **kwargs)
+
+    def post_creation(self, task_id: int, html_body: str, author: dict | None = None) -> int:
+        """El "Tarea creada" que Odoo pondría solo, pero firmado por quien la creó en campo."""
+        return self._post(task_id, author, body=html_body, message_type="notification",
+                          subtype_xmlid="project.mt_task_new")
 
     def post_note_on_task(self, task_id: int, body: str) -> None:
         """Compatibilidad con versiones anteriores (cuerpo HTML simple)."""

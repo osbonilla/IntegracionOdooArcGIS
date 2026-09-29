@@ -118,6 +118,30 @@ def get_gis():
     return _gis
 
 
+_profiles: dict[str, tuple[str | None, str | None]] = {}
+
+
+def user_profile(username: str) -> tuple[str | None, str | None]:
+    """
+    (nombre completo, correo) de un usuario de ArcGIS, para mostrarlo en
+    Odoo. Con App Authentication ArcGIS suele no entregar perfiles de
+    usuario: en ese caso devuelve (None, None) y se usa el nombre de usuario.
+    El resultado (también el fallido) se guarda para no repetir la consulta.
+    """
+    if username not in _profiles:
+        full_name = email = None
+        try:
+            user = get_gis().users.get(username)
+            if user is not None:
+                full_name = (user.get("fullName") or "").strip() or None
+                email = (user.get("email") or "").strip() or None
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Perfil de ArcGIS de '%s' no disponible (%s): se usa el nombre de usuario.",
+                        username, exc)
+        _profiles[username] = (full_name, email)
+    return _profiles[username]
+
+
 def _chunks(items: list, size: int = _BATCH):
     for i in range(0, len(items), size):
         yield items[i:i + size]

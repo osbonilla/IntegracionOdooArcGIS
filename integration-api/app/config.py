@@ -55,6 +55,15 @@ class Settings(BaseSettings):
     # exige ?token=... (recomendado cuando la API se expone con un túnel).
     integration_api_key: str | None = None
 
+    # --- Autoría en Odoo -----------------------------------------------------
+    # Lo que se hace en campo (crear, cambiar estado, observaciones, fotos)
+    # queda firmado en Odoo por el usuario de ArcGIS que lo hizo (campos
+    # Creator / Editor de la capa). Se usa el usuario INTERNO de Odoo cuyo
+    # login o correo coincide con el de ArcGIS; si no hay, un contacto con el
+    # nombre del usuario de ArcGIS. Para enlazar usuarios con nombres
+    # distintos: "usuario_arcgis=login_o_correo_odoo, otro=otro@muni.gob.ec".
+    arcgis_odoo_users: str = ""
+
     # --- Frentes de trabajo ------------------------------------------------
     # Distancia máxima (m) entre una solicitud y un frente para asignarla.
     workfront_buffer_m: float = 50.0
@@ -63,6 +72,16 @@ class Settings(BaseSettings):
     # Pasada completa periódica (red de seguridad si se pierde un webhook).
     # 0 = desactivado.
     sync_interval_minutes: int = 5
+
+    def arcgis_odoo_user_map(self) -> dict[str, str]:
+        """ARCGIS_ODOO_USERS como {usuario_arcgis (minúsculas): login/correo de Odoo}."""
+        pairs = {}
+        for item in (self.arcgis_odoo_users or "").replace(";", ",").split(","):
+            if "=" in item:
+                arcgis_user, odoo_user = (s.strip() for s in item.split("=", 1))
+                if arcgis_user and odoo_user:
+                    pairs[arcgis_user.lower()] = odoo_user
+        return pairs
 
 
 settings = Settings()

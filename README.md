@@ -431,10 +431,11 @@ perdido lo recupera el scheduler; uno duplicado o falso solo provoca una
 pasada sin cambios.
 
 **Lotes.** Los webhooks de capa no se envían por cada edición: ArcGIS los
-agrupa y los envía con una frecuencia propia del webhook (mínimo 30 s; con la
-configuración por defecto se observó ~2 min). Por eso los reportes de
-Survey123 usan además el webhook propio de Survey123, que es inmediato
-(sección 9.3).
+agrupa según la frecuencia del webhook (30 s, el mínimo, que es también el
+valor con que se crean desde la interfaz de ArcGIS Online), y la entrega
+puede tardar más: en las pruebas, el aviso llegó ~2 min después de la
+edición. Por eso los reportes de Survey123 usan además el webhook propio de
+Survey123, que es inmediato (sección 9.3).
 
 **Re-chequeos.** ArcGIS Online puede enviar el webhook *antes* de que el
 registro nuevo sea visible en las consultas (comportamiento reportado también
@@ -506,6 +507,10 @@ WEBHOOK_RECHECK_SECONDS=10,30,60
 
 # --- Frentes de trabajo ---
 WORKFRONT_BUFFER_M=50
+
+# --- Autoría en Odoo (opcional, sección 8.4) ---
+# usuario de ArcGIS = login o correo de su usuario en Odoo
+ARCGIS_ODOO_USERS=jperez_muni=jperez@muni.gob.ec, mlopez_muni=mlopez@muni.gob.ec
 
 # --- Red de seguridad (pasada completa periódica) ---
 SYNC_INTERVAL_MINUTES=5
@@ -586,8 +591,23 @@ Si el id no corresponde a una capa de entidades (por ejemplo, el del
 formulario de Survey123) o se cruzan los ids de puntos y líneas, el script
 se detiene con un mensaje `ERROR: ...` sin modificar nada.
 
-**Opción B — local** (Enterprise, o cuentas sin MFA), con el entorno de
-`scripts/` (`arcgis==2.4.3`):
+**Opción B — VS Code / PowerShell con ArcGIS Pro** (también funciona con
+MFA). Con `--pro` el script usa la sesión que ya está iniciada en ArcGIS Pro,
+así que se ejecuta con el Python de Pro (`arcgispro-py3`, que trae `arcpy`),
+no con el Python normal. Desde la raíz del repo, con ArcGIS Pro abierto y con
+la sesión iniciada en la cuenta de ArcGIS Online:
+
+```powershell
+& "C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe" scripts\setup_field_maps.py --pro --crear-frentes --acelerar-webhooks
+```
+
+Toma el id de la capa de solicitudes de `ARCGIS_FEATURE_LAYER_ITEM_ID` en
+`integration-api/.env` (o se pasa con `--solicitudes`). La primera línea
+de la salida muestra el portal y el usuario; debe ser la cuenta de ArcGIS
+Online de la demo (Pro usa su portal activo).
+
+**Opción C — usuario y contraseña** (ArcGIS Enterprise, o cuentas sin MFA),
+con cualquier Python que tenga `arcgis`:
 
 ```bash
 python scripts/setup_field_maps.py --user <usuario> --solicitudes <ITEM_ID_SOLICITUDES> --crear-frentes
@@ -597,12 +617,25 @@ Sin `--url`/`--user`/`--solicitudes`, toma los valores de
 `integration-api/.env`. Para un Enterprise de laboratorio con certificado
 autofirmado: `--no-verificar-certificado`.
 
+Con MFA, el inicio de sesión con usuario y contraseña desde un script no
+funciona, y las credenciales de App Authentication del contenedor tampoco
+sirven aquí: identifican a una aplicación, que puede leer y editar
+registros pero no cambiar la estructura de una capa ni crear capas nuevas.
+Por eso las opciones A y B usan una sesión de usuario ya iniciada.
+
 Al terminar, el script imprime los item id para el `.env`. Luego:
 
-- Si `integration-api` usa **App Authentication**, la credencial necesita
-  acceso al item nuevo de *Frentes de Trabajo* (mismo procedimiento que se
-  usó con la capa de solicitudes). Sin ese acceso, el log muestra
-  `No se encontró el item ...`.
+- Si `integration-api` usa **App Authentication**, la credencial solo llega
+  a los items privados que tiene en su lista de acceso, así que hay que
+  agregar el item nuevo de *Frentes de Trabajo*: en el item de las
+  credenciales OAuth (el del `ARCGIS_CLIENT_ID`) → *Configuración* →
+  *Aplicación* → *Credenciales* → **Editar** → *Acceso a elementos*
+  (*Item access*) → *Conceder acceso a elementos específicos* → marcar
+  *Frentes de Trabajo* → **Guardar**, y otra vez **Guardar** en
+  *Aplicación*. Después, `docker compose restart integration-api` para que
+  pida un token nuevo. Sin ese acceso, `/sync/run` devuelve errores `403`
+  (*You do not have permissions to access this resource…*) en los pasos de
+  frentes.
 - En *Configuración* de cada item se puede verificar: *Habilitar edición*,
   *Mantener un registro de los cambios*, *Habilitar sincronización*,
   *Realizar un seguimiento de quién crea y actualiza entidades* y
@@ -651,6 +684,32 @@ Survey123.
 - **Frentes.** El trazado, el nombre, el tipo, el responsable y las fechas
   se editan en campo; en Odoo esos datos se sobrescriben cuando el frente
   vuelve a editarse en campo. El estado es compartido.
+
+### 8.4. Quién aparece en Odoo (autoría)
+
+Lo que se hace en campo queda firmado en el historial (chatter) de la tarea
+por el usuario de ArcGIS que lo hizo, tomado de los campos *Creator* /
+*Editor* de la capa: el "Tarea creada", los cambios de estado
+(`In Progress → Done`), las observaciones, las fotos y los cambios de un
+frente.
+
+| Quién hizo el cambio | Cómo aparece en Odoo |
+|---|---|
+| Usuario de ArcGIS que también es usuario de Odoo (mismo login o correo, o enlazado en `ARCGIS_ODOO_USERS`) | Su usuario de Odoo |
+| Usuario de ArcGIS sin usuario en Odoo | Un contacto con su nombre completo de ArcGIS o, si ArcGIS no lo entrega (lo normal con App Authentication), su nombre de usuario. Se crea una sola vez (referencia `arcgis:<usuario>`); si se renombra en Odoo, se respeta |
+| Ciudadano en un reporte anónimo de Survey123 | El contacto del ciudadano (`citizen_name`) |
+| La propia integración (asignación por cercanía, correcciones) | El contacto *Integración ArcGIS* |
+
+Si un usuario de Field Maps crea una solicitud sin nombre de ciudadano, el
+contacto de la tarea queda como "*<usuario>* (reporte de campo)", y la
+descripción de cada frente incluye "Registrado en campo por".
+
+El campo técnico *Creado por* (`create_uid`) sigue siendo el usuario de Odoo
+con el que se conecta la integración, porque Odoo lo asigna a quien hace la
+llamada a la API. Para que ahí tampoco diga *Administrator*, conviene que la
+integración use un usuario propio de Odoo (por ejemplo *Integración ArcGIS*,
+con permisos de administrador de Proyecto) en `ODOO_USERNAME` /
+`ODOO_PASSWORD`.
 
 ---
 
@@ -717,9 +776,9 @@ webhook** (*Settings → Webhooks → Create webhook*).
 
 ### 9.3. Webhook de Survey123 (reportes en tiempo real)
 
-ArcGIS envía los webhooks de una capa **por lotes**, según una frecuencia
-propia del webhook: con el valor por defecto, el aviso llega un par de
-minutos después del cambio (se observó ~2 min). Survey123 tiene además su
+ArcGIS envía los webhooks de una capa **por lotes**: aunque el webhook esté
+configurado cada 30 s (el mínimo), en las pruebas el aviso llegó ~2 min
+después del cambio. Survey123 tiene además su
 **webhook propio**, que envía la app en el momento del envío: es la vía para
 que un reporte ciudadano aparezca en Odoo en segundos.
 
@@ -739,10 +798,16 @@ del usuario que envió la encuesta; la integración no lo usa ni lo registra.
 
 ### 9.4. Frecuencia del webhook de la capa (mínimo 30 s)
 
-Para las ediciones de Field Maps, la frecuencia del webhook de la capa se
-puede bajar a **30 s**, el mínimo que admite ArcGIS. No hay opción en la
-interfaz; se hace con `acelerar_webhooks()` de `scripts/setup_field_maps.py`
-en un ArcGIS Notebook, después de crear el webhook:
+Los webhooks creados desde la interfaz de ArcGIS Online ya vienen con la
+frecuencia mínima, **30 s**. `acelerar_webhooks()` de
+`scripts/setup_field_maps.py` lo verifica y solo lo cambia si el intervalo
+es mayor (por ejemplo, un webhook creado por REST con otro `scheduleInfo`).
+La demora de entrega de ArcGIS Online (~2 min en las pruebas) no se reduce
+desde el webhook: para las ediciones de Field Maps, el tope de espera lo da
+el scheduler (`SYNC_INTERVAL_MINUTES`; con `1`, un minuto como máximo).
+
+Desde VS Code con ArcGIS Pro se hace con `--acelerar-webhooks` (sección 7,
+opción B). En un ArcGIS Notebook, después de crear el webhook:
 
 ```python
 from arcgis.gis import GIS
@@ -751,9 +816,10 @@ acelerar_webhooks(gis, "<ITEM_ID_SOLICITUDES>")
 acelerar_webhooks(gis, "<ITEM_ID_FRENTES>")
 ```
 
-Imprime la frecuencia anterior y la nueva por cada webhook de la capa. Si
-al crear el webhook se le puso un secreto (*Secret*), se pasa de nuevo para
-que se conserve: `acelerar_webhooks(gis, "<ITEM_ID>", secreto="...")`.
+Por cada webhook imprime si ya estaba en 30 s o la frecuencia anterior y la
+nueva. Si al crear el webhook se le puso un secreto (*Secret*) y hay que
+cambiar la frecuencia, se pasa de nuevo para que se conserve:
+`acelerar_webhooks(gis, "<ITEM_ID>", secreto="...")`.
 
 ### 9.5. Automation Rule de Odoo (Odoo → integración)
 
@@ -876,14 +942,14 @@ python -m pyxform.xls2xform Survey_Odoo.xlsx salida.xml
 | Síntoma | Causa | Solución |
 |---|---|---|
 | Las mismas features se actualizan en **cada** pasada (`updated_in_arcgis` nunca llega a 0) | Un campo de la capa tiene otro tipo que el dato de Odoo (p. ej. `phone` entero con un teléfono "0999…"): ArcGIS guarda otro valor y parecía distinto siempre. Con webhooks, esto sería un bucle | La integración compara el valor convertido al tipo real del campo. El log muestra qué se escribe: `solicitudes: N actualización(es) -> oid=…: campo`. Un campo entero pierde el 0 inicial del teléfono; lo correcto es un campo de texto |
-| El aviso de la capa llega ~2 min después del cambio (el scheduler crea el registro antes que el webhook) | ArcGIS envía los webhooks de capa por lotes, con su propia frecuencia | Para Survey123, su webhook propio (sección 9.3); para Field Maps, bajar la frecuencia a 30 s (sección 9.4) |
+| El aviso de la capa llega ~2 min después del cambio (el scheduler crea el registro antes que el webhook) | ArcGIS envía los webhooks de capa por lotes y la entrega puede tardar más que su frecuencia (30 s) | Para Survey123, su webhook propio (sección 9.3); para Field Maps, verificar los 30 s (sección 9.4) y, si hace falta menos espera, `SYNC_INTERVAL_MINUTES=1` |
 | Llega el webhook (`Webhook de ArcGIS recibido`) pero el registro aparece recién con el scheduler | ArcGIS avisó antes de que el registro fuera visible en las consultas | Re-chequeos a los 10/30/60 s (`WEBHOOK_RECHECK_SECONDS`); si ArcGIS tarda más, agregar un valor mayor (p. ej. `10,30,60,120`) |
 | Al enviar desde Survey123 no aparece `Webhook de ArcGIS recibido` | La encuesta escribe en una vista de la capa | Crear el webhook también en el item de la vista (sección 9.2) |
 | Los cambios de ArcGIS no llegan a Odoo hasta la pasada periódica | El webhook no llega: túnel caído, URL del túnel cambiada, URL sin `https` | `docker compose logs tunnel`, actualizar la URL en *Configuración → Webhooks* de cada capa |
 | Log: `firma inválida o ausente` | La clave secreta de ArcGIS no coincide con `ARCGIS_WEBHOOK_SECRET` | Igualarlas; para descartar la causa, dejar la variable vacía temporalmente |
 | Los cambios de estado de Odoo tardan hasta la pasada periódica | Falta la Automation Rule, token incorrecto, o disparador mal configurado | Sección 9.5; el log debe mostrar `Pasada 'webhook: odoo'` |
 | Log: `La capa '…' no tiene los campos [...]` | No se ejecutó el script de capas, o no se redesplegó después | Sección 7 y redesplegar (sección 6) |
-| Log: `No se encontró el item …` para la capa de frentes | La credencial de App Authentication no tiene acceso al item nuevo | Dar acceso al item, igual que con la capa de solicitudes |
+| `/sync/run`: `403 You do not have permissions…` (o `No se encontró el item …`) en los pasos de frentes | La credencial de App Authentication no tiene el item nuevo en su lista de acceso | Agregarlo en *Acceso a elementos* de las credenciales OAuth (sección 7) y `docker compose restart integration-api` |
 | Las solicitudes no se asignan a un frente | Frente en estado *Cancelado*, a más de `WORKFRONT_BUFFER_M` m, o `ARCGIS_WORKFRONT_LAYER_ITEM_ID` vacío | Revisar estado, distancia y `.env`; `POST /sync/assign` fuerza el recálculo |
 | Field Maps muestra `status` como texto libre | La lista de valores no se aplicó | Script de la sección 7, o *Datos → Campos → status → Lista* |
 | Estado de campo revertido y nota "no es válido en Odoo" | Valor que Odoo no acepta (vacío, *Waiting*, texto libre) | Usar la lista de valores; es el comportamiento esperado |
