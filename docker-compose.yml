@@ -57,6 +57,15 @@ services:
     networks:
       - backend
 
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://integration-api:8000
+    depends_on:
+      - integration-api
+    networks:
+      - backend
+    restart: unless-stopped
+
 networks:
   backend:
     driver: bridge
