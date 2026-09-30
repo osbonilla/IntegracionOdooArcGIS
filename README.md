@@ -540,18 +540,7 @@ El archivo `Survey_Odoo.xlsx` es el XLSForm para apuntar a la capa *Solicitudes*
 
 ---
 
-## 12. Guion de demo (10 minutos)
-
-1. Pantalla dividida: Odoo (Kanban agrupado por Etiquetas) y el mapa web.
-2. **Ciudadano:** reporte en Survey123 con foto. Aparece en Odoo en segundos.
-3. **Despacho:** clic en *Abrir en Field Maps* desde Odoo.
-4. **Supervisor:** dibuja en Field Maps el frente *Bacheo Av. X*. Aparece en Odoo y las solicitudes cercanas se asignan automáticamente.
-5. **Cuadrilla:** marca *Hecho* y toma foto en Field Maps. La tarea de Odoo se actualiza y muestra el autor en el chatter.
-6. **Operador:** cambia un estado en Odoo; el símbolo cambia en el mapa en ~1,5 s.
-
----
-
-## 13. Troubleshooting
+## 12. Troubleshooting
 
 | Síntoma | Causa | Solución |
 |---|---|---|
@@ -564,7 +553,7 @@ El archivo `Survey_Odoo.xlsx` es el XLSForm para apuntar a la capa *Solicitudes*
 
 ---
 
-## 14. Seguridad
+## 13. Seguridad
 
 - Nunca commitear `.env`.
 - Con la API expuesta por túnel: definir `INTEGRATION_API_KEY` (protege endpoints manuales y webhook Odoo) y `ARCGIS_WEBHOOK_SECRET` (firma HMAC-SHA256).
