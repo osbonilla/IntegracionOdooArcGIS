@@ -2,6 +2,8 @@
 
 Demo técnica de integración bidireccional entre **Odoo 18** (gestión de solicitudes ciudadanas y frentes de trabajo) y **ArcGIS Online / Enterprise** (mapa, **Survey123** para reportes ciudadanos y **ArcGIS Field Maps** para edición en campo), mediante un microservicio propio en **FastAPI**.
 
+> **¿Quieres montarla desde cero?** Sigue la [sección 0 — paso a paso](#0-recrear-la-demo-desde-cero-paso-a-paso).
+
 Qué muestra la demo:
 
 - Un ciudadano reporta en Survey123 → la solicitud aparece en Odoo con su contacto, ubicación, foto y un enlace para abrirla en Field Maps.
@@ -79,11 +81,280 @@ flowchart RL
 
 ---
 
+## 0. Recrear la demo desde cero (paso a paso)
+
+Esta sección es la ruta completa, en orden. Las secciones 1 a 13 son la referencia detallada de cada paso.
+
+**Tiempo estimado:** 1,5 a 2 horas la primera vez.
+
+### Paso 0 — Qué necesitas antes de empezar
+
+- [ ] PC con **Windows 10/11** (o Linux/macOS) con **Docker Desktop** instalado y corriendo.
+- [ ] **Git** y **VS Code** (opcional, para editar el `.env`).
+- [ ] Una **organización de ArcGIS Online** con un usuario que pueda crear contenido, webhooks y credenciales de desarrollador (rol *Administrador* o *Publicador* con esos privilegios), y licencias de **Survey123**, **Field Maps** y **Dashboards** (vienen con el tipo de usuario *Creator*).
+- [ ] **ArcGIS Pro 3.x** (o un ArcGIS Notebook) para ejecutar el script de preparación de capas.
+- [ ] Un celular con la app **ArcGIS Field Maps**.
+
+### Paso 1 — Clonar el repositorio
+
+```powershell
+git clone <URL_DE_ESTE_REPO> C:\Github\IntegracionOdooArcGIS
+cd C:\Github\IntegracionOdooArcGIS
+```
+
+Estructura esperada:
+
+```
+IntegracionOdooArcGIS/
+├── docker-compose.yml          # Postgres + Odoo + integration-api + túnel
+├── integration-api/            # microservicio FastAPI
+│   ├── app/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── .env.example            # plantilla de variables
+├── scripts/setup_field_maps.py # prepara las capas en ArcGIS
+└── Survey_Odoo.xlsx            # XLSForm de la encuesta ciudadana
+```
+
+### Paso 2 — Levantar Odoo
+
+Si el repositorio no trae `docker-compose.yml`, créalo en la raíz con este contenido:
+
+```yaml
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: odoo
+      POSTGRES_PASSWORD: odoo
+    volumes:
+      - odoo-db-data:/var/lib/postgresql/data
+    networks: [backend]
+
+  odoo:
+    image: odoo:18.0
+    depends_on: [db]
+    environment:
+      HOST: db
+      USER: odoo
+      PASSWORD: odoo
+    ports:
+      - "8069:8069"
+    volumes:
+      - odoo-web-data:/var/lib/odoo
+    networks: [backend]
+
+  integration-api:
+    build: ./integration-api
+    container_name: integration-api
+    restart: unless-stopped
+    env_file: ./integration-api/.env
+    depends_on: [odoo]
+    ports:
+      - "8000:8000"
+    networks: [backend]
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://integration-api:8000
+    depends_on: [integration-api]
+    networks: [backend]
+    restart: unless-stopped
+
+volumes:
+  odoo-db-data:
+  odoo-web-data:
+
+networks:
+  backend:
+    driver: bridge
+```
+
+> Si en Windows ya tienes un PostgreSQL instalado en el puerto 5432, no hay conflicto: el contenedor `db` no publica puertos.
+
+Levanta solo la base y Odoo:
+
+```powershell
+docker compose up -d db odoo
+```
+
+1. Abre **http://localhost:8069**.
+2. Crea la base de datos:
+   - Nombre: **`odoo_demo`**
+   - Usuario y contraseña de administrador: los que pondrás en `ODOO_USERNAME` / `ODOO_PASSWORD`
+   - Idioma: *Español*
+   - *Datos de demostración*: **sin marcar**
+3. Instala la aplicación **Proyecto** (*Apps → Proyecto → Activar*).
+4. Activa el **modo desarrollador**: *Ajustes → Herramientas de desarrollador → Activar el modo desarrollador*.
+5. En *Apps*, quita el filtro *Aplicaciones* e instala también:
+   - **Automation Rules** (`base_automation`)
+   - **Partners Geolocation** (`base_geolocalize`)
+
+No hace falta crear proyectos: la integración crea *Solicitudes Ciudadanas* y *Frentes de Trabajo* la primera vez que los necesita.
+
+### Paso 3 — Crear la encuesta y la capa de solicitudes (Survey123)
+
+1. Instala **ArcGIS Survey123 Connect** o usa el sitio **survey123.arcgis.com** → *Crear una encuesta* → *Usar un XLSForm*.
+2. Carga **`Survey_Odoo.xlsx`** y publica la encuesta. Survey123 crea la **capa de entidades alojada** de solicitudes, con los campos `name`, `citizen_name`, `address`, `city`, `phone`, `email`, `status`, `odoo_partner_id`, `latitude` y `longitude`.
+3. En ArcGIS Online abre el item de esa **capa** (no el del formulario) y copia su id desde la URL `...item.html?id=<ID>`. Ese id es **`ARCGIS_FEATURE_LAYER_ITEM_ID`**.
+4. Comparte la encuesta según el escenario: público para reportes ciudadanos, u organización.
+
+### Paso 4 — Preparar las capas para Field Maps (script)
+
+El script agrega a la capa de solicitudes:
+
+- los campos `sync_*`, `observaciones` y `frente_*`;
+- la lista de estados y los adjuntos;
+- Sync, ChangeTracking y editor tracking.
+
+Además crea la capa **Frentes de Trabajo** (líneas). Detalle en la sección 7.
+
+Con ArcGIS Pro abierto y la sesión iniciada en tu organización, desde la raíz del repo:
+
+```powershell
+& "C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe" scripts\setup_field_maps.py --pro --solicitudes <ITEM_ID_SOLICITUDES> --crear-frentes --acelerar-webhooks
+```
+
+Al terminar imprime:
+
+```
+ARCGIS_FEATURE_LAYER_ITEM_ID=...
+ARCGIS_WORKFRONT_LAYER_ITEM_ID=...   ← guárdalo
+```
+
+Todas las líneas deben salir `[OK]`. Sin ArcGIS Pro, usa la opción A de la sección 7 (ArcGIS Notebook).
+
+### Paso 5 — Credenciales de App Authentication
+
+La integración entra a ArcGIS con credenciales de aplicación, sin usuario ni contraseña, así que no le afecta el MFA.
+
+1. ArcGIS Online → **Contenido → Nuevo elemento → Credenciales de desarrollador → OAuth 2.0 credentials**.
+2. Copia el **Client ID** y el **Client Secret**.
+3. En el item de las credenciales: **Configuración → Aplicación → Credenciales → Editar → Acceso a elementos → Conceder acceso a elementos específicos**. Marca **las dos capas** (solicitudes y Frentes de Trabajo).
+4. Pulsa **Guardar**, y luego **Guardar** otra vez en la sección *Aplicación*.
+
+> Si más adelante creas otra capa, también hay que agregarla aquí; si no, `/sync/run` devuelve errores `403`.
+
+### Paso 6 — Mapa web y formularios de Field Maps
+
+1. **Map Viewer** → agrega la capa de solicitudes y **Frentes de Trabajo**.
+   - Renómbralas (por ejemplo *Solicitudes ciudadanas*).
+   - Estilo de cada capa: **Tipos (símbolos únicos)** por `status`.
+   - **Guarda** el mapa (por ejemplo *Operaciones de Campo*) y copia su id. Ese id es **`ARCGIS_WEBMAP_ID`**.
+2. **Ventanas emergentes** de cada capa:
+   - título `{name}` / `{nombre}`;
+   - solo los campos útiles: quita `odoo_*`, `frente_id`, `latitude`, `longitude` y `sync_*`.
+3. **Field Maps Designer → Formularios** (sección 9.2):
+   - **Solicitudes**:
+     - editables: *Estado* (desmarca *Include "no value" option*) y *Observaciones de campo*;
+     - solo lectura (desmarca *Editable* en *Logic*): problema, dirección, ciudadano, teléfono, frente asignado.
+   - **Frentes de Trabajo**:
+     - editables: nombre (*Required*), tipo, responsable, estado, fechas, observaciones;
+     - solo lectura: longitud y solicitudes asignadas.
+   - Nunca pongas en el formulario `odoo_partner_id`, `odoo_task_id` ni `sync_*`.
+4. Pestaña **Templates**:
+   - Renombra *New Feature* de la capa de solicitudes (por ejemplo *Reporte de campo*), o bórrala si los reportes solo entran por Survey123.
+   - La plantilla *Frente de trabajo* ya viene creada.
+
+### Paso 7 — Configurar `integration-api/.env`
+
+```powershell
+copy integration-api\.env.example integration-api\.env
+```
+
+Completa como mínimo:
+
+```env
+ODOO_URL=http://odoo:8069
+ODOO_DB=odoo_demo
+ODOO_USERNAME=<usuario admin de Odoo>
+ODOO_PASSWORD=<contraseña>
+ODOO_PROJECT_NAME=Solicitudes Ciudadanas
+ODOO_WORKFRONT_PROJECT_NAME=Frentes de Trabajo
+
+ARCGIS_URL=https://www.arcgis.com
+ARCGIS_CLIENT_ID=<paso 5>
+ARCGIS_CLIENT_SECRET=<paso 5>
+ARCGIS_FEATURE_LAYER_ITEM_ID=<paso 3>
+ARCGIS_WORKFRONT_LAYER_ITEM_ID=<paso 4>
+ARCGIS_WEBMAP_ID=<paso 6>
+
+SYNC_INTERVAL_MINUTES=1
+```
+
+Las demás variables (claves de webhooks, `ARCGIS_ODOO_USERS`) son opcionales; ver sección 2.
+
+### Paso 8 — Levantar la integración y el túnel
+
+```powershell
+docker compose up -d --build integration-api tunnel
+docker compose logs integration-api --tail 30
+curl -X POST http://localhost:8000/sync/run
+```
+
+`/sync/run` debe devolver `"ok": true` y `"errors": []`.
+
+Obtén la URL pública del túnel:
+
+```powershell
+docker compose logs tunnel | Select-String trycloudflare
+```
+
+Pruébala en el navegador: `https://<algo>.trycloudflare.com/health` debe responder `{"status":"ok"}`.
+
+> La URL del túnel **cambia cada vez que el contenedor `tunnel` se reinicia**. Si eso pasa, actualízala en los webhooks del paso 9.
+
+### Paso 9 — Webhooks (tiempo real)
+
+| Dónde | Configuración |
+|---|---|
+| Item de la capa de solicitudes → **Configuración → Webhooks → Crear webhook** | Nombre `integracion-odoo-solicitudes`. URL `https://<túnel>/webhook/arcgis/solicitudes`. Eventos: features creadas, actualizadas, eliminadas y adjuntos creados |
+| Item **Frentes de Trabajo** → igual | Nombre `integracion-odoo-frentes`. URL `https://<túnel>/webhook/arcgis/frentes` |
+| **survey123.arcgis.com** → encuesta → **Configuración → Webhooks → Agregar** | URL `https://<túnel>/webhook/survey123`. Evento *Nuevo registro enviado*. Sin *Portal info* ni *User info* |
+| Odoo → **Ajustes → Técnico → Automatizaciones → Nuevo** | Modelo *Tarea*. Disparador *Al guardar*, campo *Estado*. Acción *Enviar notificación webhook* a `http://integration-api:8000/webhook/odoo` |
+
+Si definiste `INTEGRATION_API_KEY`, agrega `?token=<clave>` a las URLs de Survey123 y de Odoo (sección 8).
+
+### Paso 10 — Probar de punta a punta
+
+Deja abierto el log en una terminal: `docker compose logs -f integration-api`.
+
+1. **Survey123 → Odoo**
+   - Envía un reporte con foto desde la encuesta.
+   - En segundos aparece en **Proyecto → Solicitudes Ciudadanas**, con el ciudadano como contacto y la foto en el historial.
+2. **Field Maps → Odoo**
+   - En el celular abre el mapa, toca la solicitud → **Editar**.
+   - Pon *Hecho*, agrega una observación y una foto → **Enviar**.
+   - En 30 s a 2 min la tarea pasa a *Done* en Odoo, con las notas firmadas por tu usuario de ArcGIS.
+3. **Odoo → ArcGIS**
+   - Cambia el estado de una tarea en Odoo.
+   - En pocos segundos el punto cambia de símbolo en el mapa.
+4. **Frente de trabajo**
+   - En Field Maps: **+** → *Frente de trabajo* → traza una línea a menos de 50 m de alguna solicitud → **Enviar**.
+   - Aparece la tarea en *Frentes de Trabajo*.
+   - Las solicitudes cercanas reciben la etiqueta *Frente #… · nombre* en Odoo y el campo *Frente de trabajo* en el mapa.
+5. **(Opcional) ArcGIS Dashboards**
+   - Crea un tablero sobre las dos capas: indicadores por estado, lista de solicitudes, mapa.
+   - Se actualiza solo con cada cambio.
+
+Si algo no llega, revisa la sección 12 (*Troubleshooting*).
+
+### Checklist antes de presentar
+
+- [ ] `docker compose ps` muestra `db`, `odoo`, `integration-api` y `tunnel` en *running*.
+- [ ] La URL actual del túnel está en los dos webhooks de capa y en el de Survey123.
+- [ ] `curl -X POST http://localhost:8000/sync/run` → `"errors": []`.
+- [ ] Field Maps abre el mapa en el celular y la sesión de ArcGIS está iniciada.
+
+---
+
 ## 1. Requisitos previos
 
 - **Odoo 18** con los módulos `project`, `base_geolocalize` y `base_automation` (Automation Rules), y un usuario técnico con acceso a `project.task`, `res.partner`, `project.tags` e `ir.attachment`.
 - **ArcGIS Online** o **ArcGIS Enterprise 11.x** con webhooks de feature layer. Las capas hosted necesitan *Mantener un registro de los cambios* (change tracking); el script de la sección 7 lo habilita.
 - **ArcGIS Field Maps**: usuarios con un tipo de usuario que permita editar, y un mapa web con las dos capas (sección 9).
+- **Guía completa en orden:** sección 0.
 - **Survey123** (opcional) apuntando a la capa *Solicitudes*.
 - **Docker** + Docker Compose.
 - **Conectividad:** Con ArcGIS Online, se requiere una URL pública HTTPS para el microservicio (sección 8.1).
@@ -126,7 +397,7 @@ WEBHOOK_RECHECK_SECONDS=10,30,60
 # --- Frentes de trabajo ---
 WORKFRONT_BUFFER_M=50
 
-# --- Autoría en Odoo (opcional, sección 9.4) ---
+# --- Autoría en Odoo (opcional, sección 9.3) ---
 # usuario de ArcGIS = login o correo de su usuario en Odoo
 ARCGIS_ODOO_USERS=jperez_muni=jperez@muni.gob.ec, mlopez_muni=mlopez@muni.gob.ec
 
@@ -436,7 +707,7 @@ Se ejecuta **una sola vez**. Es idempotente: si se vuelve a correr, solo agrega 
 from arcgis.gis import GIS
 gis = GIS("home")
 preparar(gis, solicitudes_item_id="<ITEM_ID_SOLICITUDES>", crear_frentes=True)
-acelerar_webhooks(gis, "<ITEM_ID_SOLICITUDES>")   # sección 8.4
+acelerar_webhooks(gis, "<ITEM_ID_SOLICITUDES>")   # verifica que el webhook se envíe cada 30 s
 ```
 
 **Opción B — VS Code / PowerShell con ArcGIS Pro (Funciona con MFA):**
