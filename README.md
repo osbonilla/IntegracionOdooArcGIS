@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/img/portada.png" alt="Docker, ArcGIS y Odoo" width="760">
+  <img src="docs/img/portada.jpg" alt="Docker, ArcGIS y Odoo" width="760">
 </p>
 
 # Integración Odoo ↔ ArcGIS Online / Enterprise
