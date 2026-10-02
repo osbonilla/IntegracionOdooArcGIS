@@ -1,2 +1,2 @@
-odoo_partner_id,name,address,city,phone,email,status,latitude,longitude
-1,Ejemplo inicial,Av. Amazonas,Quito,0999000000,demo@demo.local,In Progress,-0.2035,-78.4919
+odoo_partner_id,name,citizen_name,address,city,phone,email,status,latitude,longitude
+1,Ejemplo inicial (borrar despues de publicar),Vecino de ejemplo,Av. Amazonas,Quito,099-900-0000,demo@demo.local,In Progress,-0.2035,-78.4919

@@ -15,14 +15,14 @@ Es idempotente: se puede ejecutar varias veces; solo agrega lo que falta
 3. En ambos servicios: Sync + ChangeTracking (requisito de los webhooks y
    de Field Maps offline) y editor tracking (quién/cuándo editó).
 
-Uso en un ArcGIS Notebook (recomendado; obligatorio con MFA en ArcGIS Online):
+Uso en un ArcGIS Notebook (funciona con MFA):
     1. Pega TODO este archivo en una celda y ejecútala (solo carga funciones).
     2. En otra celda, con el item id de la capa de solicitudes (el mismo
        ARCGIS_FEATURE_LAYER_ITEM_ID de integration-api/.env):
            from arcgis.gis import GIS
            gis = GIS("home")
            preparar(gis, solicitudes_item_id="<ITEM_ID_PUNTOS>", crear_frentes=True)
-           acelerar_webhooks(gis, "<ITEM_ID_PUNTOS>")   # webhook de la capa cada 30 s
+           acelerar_webhooks(gis, "<ITEM_ID_PUNTOS>")   # opcional, con los webhooks ya creados
 
 Uso local desde VS Code / PowerShell con ArcGIS Pro (funciona con MFA: usa la
 sesión que ya tienes iniciada en ArcGIS Pro). Se ejecuta con el Python de Pro:
@@ -350,12 +350,15 @@ def preparar(gis, solicitudes_item_id: str | None = None, crear_frentes: bool = 
 
 def acelerar_webhooks(gis, item_id: str, segundos: int = 30, secreto: str | None = None) -> None:
     """
-    Los webhooks de una capa se envían por lotes según su "scheduleInfo"; el
-    que se crea desde la interfaz puede tardar un par de minutos. Esto lo
-    baja al mínimo que permite ArcGIS Online: 30 segundos. Uso en un Notebook:
+    Los webhooks de una capa se envían por lotes según su "scheduleInfo". Esto
+    verifica que estén en el mínimo que admite ArcGIS Online (30 s) y solo los
+    cambia si tienen un intervalo mayor (los creados desde la interfaz de
+    ArcGIS Online ya vienen con 30 s). Aun así, ArcGIS Online puede tardar más
+    en entregarlos (en las pruebas, ~2 min). Uso en un Notebook:
         acelerar_webhooks(gis, "<ITEM_ID_CAPA>")
     Si al crear el webhook le pusiste un secreto (Secret), pásalo otra vez para
-    que se conserve: acelerar_webhooks(gis, "<ITEM_ID_CAPA>", secreto="...")
+    que se conserve si hay que cambiarlo:
+        acelerar_webhooks(gis, "<ITEM_ID_CAPA>", secreto="...")
     """
     from arcgis.features import FeatureLayerCollection
 
@@ -363,12 +366,16 @@ def acelerar_webhooks(gis, item_id: str, segundos: int = 30, secreto: str | None
     manager = FeatureLayerCollection.fromitem(item).manager.webhook_manager
     hooks = manager.list if manager is not None else []
     if not hooks:
-        print(f"  [--] '{item.title}' no tiene webhooks (créalo primero: README 9.2)")
+        print(f"  [--] '{item.title}' no tiene webhooks (créalo primero: README, paso 11)")
         return
     intervalo = max(30, int(segundos))
     for hook in hooks:
         nombre = hook.properties.get("name")
         antes = dict(hook.properties.get("scheduleInfo") or {}).get("recurrenceInfo")
+        actual_s = _segundos(antes)
+        if actual_s is not None and actual_s <= intervalo:
+            _ok(f"webhook '{nombre}' ya se envía cada {actual_s} s (sin cambios)")
+            continue
         cambios = {"schedule_info": {
             "name": f"cada-{intervalo}s",
             "startAt": int(time.time() * 1000),
@@ -380,6 +387,15 @@ def acelerar_webhooks(gis, item_id: str, segundos: int = 30, secreto: str | None
         hook.edit(**cambios)
         despues = dict(hook.properties.get("scheduleInfo") or {}).get("recurrenceInfo")
         print(f"  [OK] webhook '{nombre}': {antes} -> {despues}")
+
+
+def _segundos(recurrencia) -> int | None:
+    """{"frequency": "minute", "interval": 2} -> 120 (None si no se puede leer)."""
+    factor = {"second": 1, "minute": 60, "hour": 3600, "day": 86400, "week": 604800}
+    try:
+        return int(recurrencia["interval"]) * factor[str(recurrencia["frequency"]).lower()]
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _leer_env(path):
@@ -430,7 +446,8 @@ def main():
     p.add_argument("--crear-frentes", action="store_true",
                    help="crea la capa de líneas (o reutiliza la tuya si ya existe)")
     p.add_argument("--acelerar-webhooks", action="store_true",
-                   help="baja a 30 s el envío de los webhooks de las capas (README 9.4)")
+                   help="verifica que los webhooks de las capas se envíen cada 30 s, el "
+                        "mínimo (README, paso 11)")
     p.add_argument("--no-verificar-certificado", action="store_true",
                    help="solo para Enterprise de laboratorio con certificado autofirmado")
     a = p.parse_args()
@@ -455,9 +472,10 @@ def main():
         resultado = preparar(gis, a.solicitudes or env.get("ARCGIS_FEATURE_LAYER_ITEM_ID"),
                              crear_frentes=a.crear_frentes, frentes_item_id=a.frentes)
         if a.acelerar_webhooks:
-            print("\n== Webhooks de las capas cada 30 s")
+            print("\n== Frecuencia de los webhooks de las capas (mínimo 30 s)")
+            secreto = env.get("ARCGIS_WEBHOOK_SECRET") or None   # se conserva si hay que editarlo
             for item_id in resultado.values():
-                acelerar_webhooks(gis, item_id)
+                acelerar_webhooks(gis, item_id, secreto=secreto)
     except ErrorDeConfiguracion as exc:
         sys.exit(f"ERROR: {exc}")
 
@@ -470,7 +488,7 @@ En una celda nueva ejecuta esto, con el item id de tu capa de solicitudes
     from arcgis.gis import GIS
     gis = GIS("home")
     preparar(gis, solicitudes_item_id="<ITEM_ID_SOLICITUDES>", crear_frentes=True)
-    acelerar_webhooks(gis, "<ITEM_ID_SOLICITUDES>")
+    acelerar_webhooks(gis, "<ITEM_ID_SOLICITUDES>")   # opcional, con los webhooks ya creados
 """
 
 

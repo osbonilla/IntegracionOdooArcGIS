@@ -51,7 +51,7 @@ services:
       - "8000:8000"
     # Si ArcGIS Enterprise corre en un host cuyo nombre solo resuelve vía
     # DNS local de Windows (mDNS/LLMNR) y no desde dentro de Docker,
-    # descomentar y ajustar (ver README sección 9 - Troubleshooting):
+    # descomentar y ajustar (ver README, sección 14 - Troubleshooting):
     # extra_hosts:
     #   - "tu-host.dominio.local:host-gateway"
     networks:
