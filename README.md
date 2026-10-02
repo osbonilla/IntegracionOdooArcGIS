@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/img/portada.png" alt="Docker, ArcGIS y Odoo" width="760">
+</p>
+
 # Integración Odoo ↔ ArcGIS Online / Enterprise
 
 Demo técnica de integración bidireccional entre **Odoo 18** (gestión de solicitudes ciudadanas y frentes de trabajo) y **ArcGIS Online / Enterprise** (mapa, **Survey123** para reportes ciudadanos, **ArcGIS Field Maps** para trabajo en campo y **ArcGIS Dashboards** para monitoreo), mediante un microservicio propio en **FastAPI**.
