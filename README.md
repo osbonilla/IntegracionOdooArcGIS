@@ -315,35 +315,14 @@ La estructura del repositorio está en la [sección 4.1](#41-estructura-del-repo
 
 **Opción B — Por script (ArcGIS Enterprise o cuentas sin MFA):** `scripts/create_arcgis_feature_layer.py`, con `ARCGIS_USERNAME` / `ARCGIS_PASSWORD` en `scripts/.env`. Crea la misma capa vacía (sección 4.3).
 
-### Paso 5 — Encuesta de Survey123
-
-El formulario de referencia es `survey/Survey_Odoo.xlsx`.
-
-| Pregunta | Campo |
-|---|---|
-| Ubicación (mapa) | geometría del punto |
-| Nombre completo | `citizen_name` |
-| Problema (texto largo) | `name` |
-| Dirección de referencia | `address` |
-| Ciudad | `city` |
-| Teléfono | `phone` |
-| Correo | `email` |
-| Campos de sistema ocultos | `odoo_partner_id`, `status`, `latitude`, `longitude` |
-
-1. Abrir `survey/Survey_Odoo.xlsx`. En la hoja **settings**, poner en `submission_url` la URL del item de la capa del paso 4: `https://www.arcgis.com/sharing/rest/content/items/<ITEM_ID>`. En Enterprise, la URL equivalente del portal.
-2. En **Survey123 Connect**: *Nueva encuesta → Archivo*, y elegir el XLSForm. Luego **Publicar**. La encuesta queda conectada a la capa existente y no crea otra.
-3. Compartir la encuesta:
-   - pública (*Todos*) si la ciudadanía reporta sin iniciar sesión;
-   - con la organización, para pruebas internas.
-
-> Si se combina este XLSForm con otro generado por Survey123 Connect, las filas se copian **por nombre de columna, nunca por posición**. Copiar por posición produce el error *Duplicate column header: instance_name*.
-
-### Paso 6 — Preparar las capas para Field Maps
+### Paso 5 — Preparar las capas para Field Maps
 
 `scripts/setup_field_maps.py` hace lo siguiente (detalle en la [sección 4.3](#43-scripts)):
 - agrega a la capa de solicitudes los campos de sincronización (`sync_*`), `observaciones` y `frente_*`;
 - configura la lista de estados y habilita adjuntos, Sync, ChangeTracking y editor tracking;
 - **crea la capa Frentes de Trabajo** (líneas).
+
+Este paso va antes de la encuesta porque habilita los adjuntos, donde Survey123 guarda las fotos.
 
 Con ArcGIS Pro abierto y la sesión iniciada en la organización, desde la raíz del repositorio:
 
@@ -356,6 +335,43 @@ Con ArcGIS Pro abierto y la sesión iniciada en la organización, desde la raíz
 - Al final imprime `ARCGIS_WORKFRONT_LAYER_ITEM_ID=<id>`; ese valor se guarda para el `.env`.
 - El script es idempotente: volver a ejecutarlo solo agrega lo que falta y reutiliza la capa de frentes existente.
 - Sin ArcGIS Pro, se usa un ArcGIS Notebook: se pega el archivo completo en una celda y en otra se ejecuta `preparar(GIS("home"), solicitudes_item_id="<ID>", crear_frentes=True)`.
+
+### Paso 6 — Encuesta de Survey123
+
+El formulario de referencia es `survey/Survey_Odoo.xlsx`.
+
+| Pregunta | Dónde se guarda |
+|---|---|
+| Ubicación (mapa) | geometría del punto |
+| Nombre completo | `citizen_name` |
+| Problema (texto largo) | `name` |
+| Fotos del problema (opcional, hasta 3) | adjuntos del punto |
+| Dirección de referencia | `address` |
+| Ciudad | `city` |
+| Teléfono | `phone` |
+| Correo | `email` |
+| Campos de sistema ocultos | `odoo_partner_id`, `status`, `latitude`, `longitude` |
+
+**Fotos:** no ocupan un campo de la capa. Survey123 las guarda como adjuntos del punto, y la integración las copia a la tarea de Odoo con una nota firmada por quien envió el reporte (sección 5.2). Por eso la capa necesita los adjuntos que habilita el paso 5. La pregunta se define así en la hoja **survey**:
+
+| type | name | label | appearance | constraint | parameters |
+|---|---|---|---|---|---|
+| `image` | `foto` | Fotos del problema | `multiline` | `count-selected(${foto}) <= 3` | `max-pixels=1280` |
+
+- `multiline` permite varias fotos en una sola pregunta y `count-selected` las limita a tres.
+- `max-pixels=1280` reduce cada foto a 1.280 px en su lado mayor: el envío es más rápido desde el celular y las fotos quedan muy por debajo del límite de 25 MB que copia la integración.
+
+Publicación:
+
+1. Abrir `survey/Survey_Odoo.xlsx`. En la hoja **settings**, poner en `submission_url` la URL del item de la capa del paso 4: `https://www.arcgis.com/sharing/rest/content/items/<ITEM_ID>`. En Enterprise, la URL equivalente del portal.
+2. En **Survey123 Connect**: *Nueva encuesta → Archivo*, y elegir el XLSForm. Luego **Publicar**. La encuesta queda conectada a la capa existente y no crea otra.
+3. Compartir la encuesta:
+   - pública (*Todos*) si la ciudadanía reporta sin iniciar sesión;
+   - con la organización, para pruebas internas.
+
+> **Encuesta ya publicada sin fotos:** se abre la encuesta en Survey123 Connect, se agrega la fila `foto` de la tabla anterior al XLSForm de la encuesta (debajo de la pregunta del problema), se guarda y se vuelve a **Publicar**. La capa no cambia de esquema y los envíos anteriores se conservan.
+
+> Si se combina este XLSForm con otro generado por Survey123 Connect, las filas se copian **por nombre de columna, nunca por posición**. Copiar por posición produce el error *Duplicate column header: instance_name*.
 
 ### Paso 7 — Credenciales de App Authentication
 
@@ -410,7 +426,7 @@ ARCGIS_URL=https://www.arcgis.com
 ARCGIS_CLIENT_ID=<paso 7>
 ARCGIS_CLIENT_SECRET=<paso 7>
 ARCGIS_FEATURE_LAYER_ITEM_ID=<paso 4>
-ARCGIS_WORKFRONT_LAYER_ITEM_ID=<paso 6>
+ARCGIS_WORKFRONT_LAYER_ITEM_ID=<paso 5>
 ARCGIS_WEBMAP_ID=<paso 8>
 
 SYNC_INTERVAL_MINUTES=1
@@ -447,7 +463,7 @@ curl -X POST http://localhost:8000/sync/run
 
 Con `INTEGRATION_API_KEY` definida, las URLs de Survey123 y de Odoo llevan además `?token=<clave>`. Con `ARCGIS_WEBHOOK_SECRET`, el mismo valor va en el campo *Secret* de los webhooks de capa (sección 15).
 
-Los webhooks de capa creados desde la interfaz ya se envían cada 30 s, el mínimo de ArcGIS Online. Para comprobarlo, se repite el comando del paso 6 con `--acelerar-webhooks` al final: informa el intervalo de cada webhook y solo lo cambia si es mayor.
+Los webhooks de capa creados desde la interfaz ya se envían cada 30 s, el mínimo de ArcGIS Online. Para comprobarlo, se repite el comando del paso 5 con `--acelerar-webhooks` al final: informa el intervalo de cada webhook y solo lo cambia si es mayor.
 
 ### Paso 12 — (Opcional) Panel en ArcGIS Dashboards
 
@@ -625,9 +641,9 @@ IntegracionOdooArcGIS/
 
 ### 4.4. `survey/Survey_Odoo.xlsx`
 
-XLSForm de la encuesta ciudadana (paso 5).
+XLSForm de la encuesta ciudadana (paso 6).
 
-- Las preguntas visibles corresponden a los datos del ciudadano y del problema.
+- Las preguntas visibles corresponden a los datos del ciudadano y del problema, más hasta tres fotos (pregunta `foto`, tipo `image`), que se guardan como adjuntos del punto.
 - `odoo_partner_id`, `status`, `latitude` y `longitude` son campos ocultos que llena la integración.
 - `submission_url` conecta la encuesta con la capa existente.
 
@@ -858,7 +874,7 @@ La columna **Manda** indica qué lado es dueño de cada dato:
 | geometría | Punto | compartido | `res.partner.partner_latitude/longitude` |
 | `latitude`, `longitude` | Doble | calculado | copia de la geometría |
 | `observaciones` | Texto (1000) | campo | cada texto nuevo → nota en el historial |
-| adjuntos | Fotos / archivos | campo | → `ir.attachment` de la tarea + nota |
+| adjuntos | Fotos / archivos | campo | fotos de Survey123 (pregunta `foto`) y de Field Maps → `ir.attachment` de la tarea + nota |
 | `frente_id`, `frente_nombre` | Entero / Texto | calculado | frente de trabajo asignado |
 | `sync_status`, `sync_geom`, `sync_obs` | Texto | sistema | base del merge de tres vías |
 
@@ -1087,7 +1103,7 @@ Los números de esta tabla son **estimaciones**: provienen de multiplicar las pe
 | Existencia | Un frente creado en Odoo no se publica en el mapa (el trazado solo existe en ArcGIS) | Los frentes se crean solo desde Field Maps | — |
 | Datos | Las tareas de Odoo sin coordenadas no se publican (`skipped_no_coordinates`) | No aparecen en el mapa | Cargar latitud y longitud en el contacto |
 | Datos | Fotos y observaciones viajan solo de ArcGIS a Odoo | Lo adjuntado o comentado en Odoo no aparece en el mapa | — |
-| Datos | Adjuntos de más de 25 MB no se copian | Se registra un aviso en el log | Comprimir las fotos o configurar Field Maps con tamaño reducido |
+| Datos | Adjuntos de más de 25 MB no se copian | Se registra un aviso en el log | Survey123 ya reduce las fotos (`max-pixels=1280`); en Field Maps, usar un tamaño de foto reducido |
 | Datos | Tipos distintos entre Odoo y la capa (por ejemplo, teléfono entero) | Se pierde el 0 inicial; la conversión evita bucles de escritura | Usar texto para teléfonos (plantilla CSV y XLSForm) |
 | Estados | `Waiting` no se puede escribir; la lista de ArcGIS usa las etiquetas de Odoo en inglés como código | Las notas muestran los estados en inglés | Nombre visible en español en la lista de valores |
 | Despliegue | El túnel rápido de Cloudflare cambia de URL en cada reinicio y no tiene garantías de servicio | Hay que actualizar los webhooks; no es apto para producción | Túnel con nombre, dominio propio o proxy inverso con TLS |
@@ -1165,7 +1181,7 @@ Resumen de una pasada (`/sync/run`, `/sync/last`):
 | `/sync/run`: `403 You do not have permissions…` en los pasos de frentes | La credencial de App Authentication no tiene el item en su lista de acceso | Agregarlo en *Acceso a elementos* (paso 7) y ejecutar `docker compose restart integration-api` |
 | Los webhooks dejaron de llegar | Cambió la URL del túnel | `docker compose logs tunnel \| Select-String trycloudflare` y actualizar los tres webhooks |
 | Un endpoint nuevo responde `404` o un cambio de código "no hace nada" | Se recreó el contenedor sin reconstruir la imagen | `docker compose up -d --build --force-recreate integration-api` |
-| Log: `La capa '…' no tiene los campos […]` | Falta ejecutar el script de preparación | Paso 6 y luego reiniciar la integración |
+| Log: `La capa '…' no tiene los campos […]` | Falta ejecutar el script de preparación | Paso 5 y luego reiniciar la integración |
 | Las mismas features se actualizan en **cada** pasada | Un campo tiene otro tipo de dato en la capa que en Odoo | La conversión por tipo lo evita; si persiste, el log `actualización(es) -> oid=…` indica el campo |
 | El reporte aparece recién con el scheduler | ArcGIS avisó antes de que el registro fuera visible | Los re-chequeos (`WEBHOOK_RECHECK_SECONDS`) lo toman; si tarda más, se amplía la lista |
 | Las encuestas enviadas a una *vista* de la capa no disparan el webhook | El webhook está en la capa original | Crear el mismo webhook también en el item de la vista |
@@ -1176,7 +1192,9 @@ Resumen de una pasada (`/sync/run`, `/sync/last`):
 | ArcGIS Enterprise no resuelve su nombre de host desde Docker | El nombre solo resuelve con el DNS local de Windows | Descomentar `extra_hosts` en `docker-compose.yml` |
 | Log de Odoo: `Posting HTML message using body_is_html=True` | Aviso inofensivo de Odoo 17/18 al publicar notas por XML-RPC | Ignorar |
 | Coordenadas absurdas en Odoo (`lat ≈ -20000`) | Geometría leída en Web Mercator | La integración consulta siempre en WGS84 y corrige esas coordenadas en Odoo |
-| *Duplicate column header: instance_name* | XLSForm combinado por posición | Copiar filas por nombre de columna (paso 5) |
+| *Duplicate column header: instance_name* | XLSForm combinado por posición | Copiar filas por nombre de columna (paso 6) |
+| Survey123 Connect no publica la encuesta por la pregunta `foto` | La capa no tiene adjuntos habilitados | Ejecutar el paso 5 y publicar de nuevo |
+| La encuesta no muestra la opción de fotos | Encuesta publicada con una versión anterior del XLSForm | Agregar la fila `foto` y volver a publicar (paso 6) |
 
 ---
 
