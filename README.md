@@ -6,8 +6,6 @@
 
 Demo técnica de integración bidireccional entre **Odoo 18** (gestión de solicitudes ciudadanas y frentes de trabajo) y **ArcGIS Online / Enterprise** (mapa, **Survey123** para reportes ciudadanos, **ArcGIS Field Maps** para trabajo en campo y **ArcGIS Dashboards** para monitoreo), mediante un microservicio propio en **FastAPI**.
 
-> **Montaje desde cero:** [sección 3](#3-montaje-desde-cero-paso-a-paso). **Qué hace cada archivo:** [sección 4](#4-qué-hace-cada-archivo). **Ediciones simultáneas:** [sección 8](#8-ediciones-simultáneas-y-conflictos). **Limitaciones y prueba de carga:** [secciones 10 y 11](#10-pruebas-realizadas).
-
 ## Contenido
 
 1. [Qué resuelve la solución](#1-qué-resuelve-la-solución)
