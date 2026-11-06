@@ -57,9 +57,31 @@ services:
     networks:
       - backend
 
+  # ── Publicación de la API para los webhooks de ArcGIS Online ──────────
+  # Se elige UNA opción con COMPOSE_PROFILES en el .env de la raíz
+  # (README, sección 17). Con ArcGIS Enterprise en la misma red no se usa
+  # ninguna: la API se publica con IIS o Nginx.
+
+  # Túnel rápido de Cloudflare: sin cuenta, pero la URL cambia en cada reinicio.
   tunnel:
     image: cloudflare/cloudflared:latest
+    profiles: ["cloudflare"]
     command: tunnel --no-autoupdate --url http://integration-api:8000
+    depends_on:
+      - integration-api
+    networks:
+      - backend
+    restart: unless-stopped
+
+  # ngrok con dominio fijo: la URL no cambia (NGROK_AUTHTOKEN y NGROK_DOMAIN).
+  ngrok:
+    image: ngrok/ngrok:latest
+    profiles: ["ngrok"]
+    command: http integration-api:8000 --url=${NGROK_DOMAIN:-}
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
+    ports:
+      - "127.0.0.1:4040:4040"     # inspector de peticiones de ngrok (solo local)
     depends_on:
       - integration-api
     networks:

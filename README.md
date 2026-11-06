@@ -24,6 +24,7 @@ Demo técnica de integración bidireccional entre **Odoo 18** (gestión de solic
 14. [Troubleshooting](#14-troubleshooting)
 15. [Seguridad](#15-seguridad)
 16. [Evolución recomendada para producción](#16-evolución-recomendada-para-producción)
+17. [Publicación de la API: túnel, ngrok y ArcGIS Enterprise](#17-publicación-de-la-api-túnel-ngrok-y-arcgis-enterprise)
 
 > Los diagramas están en **Mermaid**. GitHub y GitLab los muestran de forma nativa. En VS Code se necesita la extensión *Markdown Preview Mermaid Support* (`bierner.markdown-mermaid`).
 
@@ -53,7 +54,7 @@ Un microservicio mantiene ambos lados sincronizados.
 | Odoo 18 + PostgreSQL 15 | Docker | ERP: proyectos, tareas, contactos, historial (chatter) |
 | ArcGIS Online / Enterprise | SaaS / on-premise | Capas alojadas, mapa web, Survey123, Field Maps, Dashboards |
 | `integration-api` | Python 3.11, FastAPI, ArcGIS API for Python 2.4.3, XML-RPC | Recibe avisos (webhooks) y ejecuta la sincronización |
-| Túnel HTTPS | Cloudflare `cloudflared` | Publica la API en internet para que ArcGIS Online le envíe webhooks |
+| Publicación HTTPS | Cloudflare `cloudflared` o ngrok (ArcGIS Online); IIS o Nginx (ArcGIS Enterprise) | Da a la API la URL HTTPS a la que ArcGIS envía los webhooks (sección 17) |
 | Scripts de preparación | Python | Crean y configuran las capas; cargan datos de ejemplo en Odoo |
 
 ---
@@ -87,7 +88,7 @@ flowchart RL
         sched --> pipe
     end
 
-    TUN{{"Túnel HTTPS<br/>cloudflared"}}
+    TUN{{"Túnel HTTPS<br/>cloudflared / ngrok"}}
 
     subgraph ESRI["ArcGIS Online / Enterprise"]
         direction TB
@@ -130,7 +131,7 @@ flowchart RL
 - **Flechas gruesas:** avisos en tiempo real (*push*). Odoo avisa con una Automation Rule; ArcGIS avisa con el webhook nativo de cada capa y con el webhook propio de Survey123.
 - **Flechas finas:** llamadas que **siempre inicia `integration-api`**: XML-RPC hacia Odoo y ArcGIS API for Python hacia las capas.
 - **Survey123 y Field Maps escriben directo en las capas** y nunca pasan por el microservicio. El webhook es lo que dispara la sincronización.
-- **Túnel HTTPS:** ArcGIS Online está en la nube y no puede llamar a `localhost`; el microservicio necesita una URL pública HTTPS. Odoo, en cambio, llega a la API por la red interna de Docker.
+- **Túnel HTTPS:** ArcGIS Online está en la nube y no puede llamar a `localhost`; el microservicio necesita una URL pública HTTPS (Cloudflare o ngrok). Con ArcGIS Enterprise en la red del municipio, el túnel se reemplaza por un proxy inverso con HTTPS (IIS o Nginx). Odoo, en cambio, llega a la API por la red interna de Docker. Detalle en la [sección 17](#17-publicación-de-la-api-túnel-ngrok-y-arcgis-enterprise).
 
 ### 2.2. Componentes del código
 
@@ -158,7 +159,7 @@ flowchart TB
         seed["seed_odoo_demo_data.py"]
     end
 
-    tun{{"Túnel HTTPS · cloudflared"}}
+    tun{{"Túnel HTTPS · cloudflared / ngrok"}}
 
     subgraph API["integration-api/app"]
         direction TB
@@ -249,6 +250,7 @@ Ruta completa y en orden para recrear la demo en otra máquina y otra organizaci
 - [ ] **ArcGIS Pro 3.x** o acceso a **ArcGIS Notebooks**, para ejecutar el script de preparación de capas.
 - [ ] **ArcGIS Survey123 Connect**, para publicar la encuesta desde el XLSForm.
 - [ ] Un celular con la app **ArcGIS Field Maps**.
+- [ ] Con ArcGIS Online: una cuenta gratuita de **ngrok**, para que la URL de los webhooks no cambie (sección 17.2). Con ArcGIS Enterprise: acceso al IIS o Nginx del portal (sección 17.4).
 
 ### Paso 1 — Clonar el repositorio
 
@@ -261,7 +263,7 @@ La estructura del repositorio está en la [sección 4.1](#41-estructura-del-repo
 
 ### Paso 2 — Levantar Odoo
 
-1. Copiar `.env.example` (raíz) como `.env`, y cambiar `ODOO_DB_PASSWORD`. Es la contraseña del usuario de PostgreSQL que usa Odoo.
+1. Copiar `.env.example` (raíz) como `.env`, y cambiar `ODOO_DB_PASSWORD`. Es la contraseña del usuario de PostgreSQL que usa Odoo. Las variables del túnel (`COMPOSE_PROFILES`, `NGROK_*`) se completan en el paso 10.
 2. Editar `odoo/config/odoo.conf` y cambiar `admin_passwd`. Es la *contraseña maestra* que pide Odoo para crear o borrar bases de datos.
    - `dbfilter = ^odoo_demo$` obliga a que la base se llame **`odoo_demo`**.
 3. Levantar la base de datos y Odoo:
@@ -434,10 +436,18 @@ ARCGIS_WEBMAP_ID=<paso 8>
 SYNC_INTERVAL_MINUTES=1
 ```
 
-### Paso 10 — Levantar la integración y el túnel
+### Paso 10 — Levantar la integración y publicarla
+
+La API necesita una URL HTTPS para recibir los webhooks de ArcGIS. Se elige la forma de publicarla con `COMPOSE_PROFILES` en el `.env` de la raíz (detalle en la [sección 17](#17-publicación-de-la-api-túnel-ngrok-y-arcgis-enterprise)):
+
+| Opción | `COMPOSE_PROFILES` | URL |
+|---|---|---|
+| Túnel rápido de Cloudflare (sin cuenta) | `cloudflare` | Cambia en cada reinicio: hay que actualizar los webhooks |
+| **ngrok con dominio fijo** (recomendada para ArcGIS Online) | `ngrok` | Fija; requiere `NGROK_AUTHTOKEN` y `NGROK_DOMAIN` (sección 17.2) |
+| ArcGIS Enterprise en la red del municipio | vacío | Proxy inverso con IIS o Nginx (sección 17.4) |
 
 ```powershell
-docker compose up -d --build integration-api tunnel
+docker compose up -d --build --remove-orphans
 docker compose logs integration-api --tail 30
 curl -X POST http://localhost:8000/sync/run
 ```
@@ -446,21 +456,20 @@ curl -X POST http://localhost:8000/sync/run
 - Si se cargaron los datos de ejemplo, aparecen `created_in_arcgis: 8`.
 - Con `INTEGRATION_API_KEY` definida, la llamada lleva la clave: `curl -X POST -H "X-API-Key: <clave>" http://localhost:8000/sync/run`.
 - En Windows PowerShell 5.1, `curl` es un alias de `Invoke-WebRequest` y no acepta `-X`; en ese caso se escribe `curl.exe`.
-- URL pública del túnel:
-  ```powershell
-  docker compose logs tunnel | Select-String trycloudflare
-  ```
-  En el navegador, `https://<algo>.trycloudflare.com/health` debe responder `{"status":"ok"}`.
+- URL pública:
+  - **ngrok:** la de `NGROK_DOMAIN`, siempre la misma.
+  - **Cloudflare:** `docker compose logs tunnel | Select-String trycloudflare`.
+  - En el navegador, `https://<URL pública>/health` debe responder `{"status":"ok"}`.
 
-> La URL del túnel **cambia cada vez que se reinicia el contenedor `tunnel`**. En ese caso se actualiza en los webhooks del paso 11.
+> Con el túnel rápido de Cloudflare, la URL **cambia cada vez que se reinicia el contenedor `tunnel`** (también al apagar Docker), y los webhooks del paso 11 quedan apuntando a la anterior. ngrok con dominio fijo evita el problema.
 
 ### Paso 11 — Webhooks (tiempo real)
 
 | Dónde | Configuración |
 |---|---|
-| Item de la capa de solicitudes → **Configuración → Webhooks → Crear webhook** | Nombre `integracion-odoo-solicitudes`. URL `https://<túnel>/webhook/arcgis/solicitudes`. Eventos: entidades creadas, actualizadas y eliminadas, y adjuntos creados |
-| Item *Frentes de Trabajo* → igual | Nombre `integracion-odoo-frentes`. URL `https://<túnel>/webhook/arcgis/frentes` |
-| **survey123.arcgis.com** → encuesta → **Configuración → Webhooks → Agregar** | URL `https://<túnel>/webhook/survey123`. Evento *Nuevo registro enviado*. Sin *Portal info* ni *User info* (incluyen el token del usuario) |
+| Item de la capa de solicitudes → **Configuración → Webhooks → Crear webhook** (en Enterprise: *Organización → Configuración → Webhooks*, sección 17.4) | Nombre `integracion-odoo-solicitudes`. URL `https://<URL pública>/webhook/arcgis/solicitudes`. Eventos: entidades creadas, actualizadas y eliminadas, y adjuntos creados |
+| Item *Frentes de Trabajo* → igual | Nombre `integracion-odoo-frentes`. URL `https://<URL pública>/webhook/arcgis/frentes` |
+| **survey123.arcgis.com** → encuesta → **Configuración → Webhooks → Agregar** | URL `https://<URL pública>/webhook/survey123`. Evento *Nuevo registro enviado*. Sin *Portal info* ni *User info* (incluyen el token del usuario) |
 | Odoo → **Ajustes → Técnico → Automatizaciones → Nuevo** | Modelo *Tarea*. Disparador *Al guardar*, campo *Estado*. Acción *Enviar notificación webhook* a `http://integration-api:8000/webhook/odoo` |
 
 Con `INTEGRATION_API_KEY` definida, las URLs de Survey123 y de Odoo llevan además `?token=<clave>`. Con `ARCGIS_WEBHOOK_SECRET`, el mismo valor va en el campo *Secret* de los webhooks de capa (sección 15).
@@ -488,8 +497,8 @@ Dejar el log abierto en una terminal: `docker compose logs -f integration-api`.
 
 ### Checklist antes de presentar
 
-- [ ] `docker compose ps` muestra `db`, `odoo`, `integration-api` y `tunnel` en ejecución.
-- [ ] La URL actual del túnel está en los dos webhooks de capa y en el de Survey123.
+- [ ] `docker compose ps` muestra `db`, `odoo`, `integration-api` y el túnel elegido (`ngrok` o `tunnel`) en ejecución.
+- [ ] La URL pública actual está en los dos webhooks de capa y en el de Survey123 (con ngrok de dominio fijo no cambia).
 - [ ] `curl -X POST http://localhost:8000/sync/run` devuelve `"errors": []`.
 - [ ] Field Maps abre el mapa en el celular con la sesión de ArcGIS iniciada.
 
@@ -501,8 +510,8 @@ Dejar el log abierto en una terminal: `docker compose logs -f integration-api`.
 
 ```
 IntegracionOdooArcGIS/
-├── docker-compose.yml            # db (PostgreSQL 15) · odoo (18.0) · integration-api · tunnel
-├── .env.example                  # usuario y contraseña de PostgreSQL para docker compose
+├── docker-compose.yml            # db (PostgreSQL 15) · odoo (18.0) · integration-api · tunnel / ngrok
+├── .env.example                  # PostgreSQL, túnel elegido (COMPOSE_PROFILES) y ngrok
 ├── odoo/
 │   ├── config/odoo.conf          # contraseña maestra, filtro de base (^odoo_demo$)
 │   └── addons/                   # módulos propios de Odoo (vacío en esta demo)
@@ -653,10 +662,10 @@ XLSForm de la encuesta ciudadana (paso 6).
 
 | Archivo | Contenido |
 |---|---|
-| `docker-compose.yml` | **`db`**: PostgreSQL 15 con volumen persistente y healthcheck. **`odoo`**: Odoo 18, puerto 8069, monta `odoo/config` y `odoo/addons`. **`integration-api`**: build de `integration-api/`, puerto 8000, lee `integration-api/.env`. **`tunnel`**: `cloudflared` hacia `http://integration-api:8000`. Todos en la red `backend` |
+| `docker-compose.yml` | **`db`**: PostgreSQL 15 con volumen persistente y healthcheck. **`odoo`**: Odoo 18, puerto 8069, monta `odoo/config` y `odoo/addons`. **`integration-api`**: build de `integration-api/`, puerto 8000, lee `integration-api/.env`. **`tunnel`** (perfil `cloudflare`): túnel rápido de `cloudflared` hacia `http://integration-api:8000`. **`ngrok`** (perfil `ngrok`): ngrok con dominio fijo; inspector en `http://localhost:4040`. Solo arranca el perfil indicado en `COMPOSE_PROFILES`. Todos en la red `backend` |
 | `odoo/config/odoo.conf` | `admin_passwd` (contraseña maestra), `dbfilter = ^odoo_demo$`, `list_db = True`. Configuración de demo, no de producción |
 | `integration-api/Dockerfile` | Imagen `python:3.11-slim`, instala dependencias, copia `app/`, healthcheck en `/health`, arranca `uvicorn` |
-| `.env.example` (raíz) | `ODOO_DB_USER` / `ODOO_DB_PASSWORD` para PostgreSQL |
+| `.env.example` (raíz) | `ODOO_DB_USER` / `ODOO_DB_PASSWORD` para PostgreSQL; `COMPOSE_PROFILES`, `NGROK_AUTHTOKEN` y `NGROK_DOMAIN` para la publicación de la API |
 
 > **Cambios de código:** `docker compose up -d --force-recreate` sin `--build` reutiliza la imagen anterior, que tiene copiado el código viejo. Siempre que cambia un `.py`: `docker compose up -d --build --force-recreate integration-api`. Cuando solo cambia el `.env`: `docker compose up -d --force-recreate integration-api`.
 
@@ -698,7 +707,7 @@ flowchart LR
 - **Espera y agrupamiento:** el runner espera `WEBHOOK_DEBOUNCE_SECONDS` (3 s) y ejecuta **una** pasada con todos los avisos acumulados. Una ráfaga de 50 webhooks produjo una sola pasada (sección 10.2). La espera también deja que Odoo confirme su transacción: la Automation Rule llama al webhook *antes* del commit.
 - **Re-chequeos:** ArcGIS Online puede avisar antes de que el registro nuevo sea visible en las consultas. Tras cada aviso de ArcGIS se programan pasadas extra a los 10, 30 y 60 s (`WEBHOOK_RECHECK_SECONDS`).
 - **Una pasada a la vez:** un candado evita pasadas simultáneas. Si llega un aviso durante una pasada, se ejecuta una más al terminar. El scheduler no espera: si hay una pasada en curso, omite su turno.
-- **Red de seguridad:** el scheduler ejecuta una pasada completa cada `SYNC_INTERVAL_MINUTES`. Recupera cualquier aviso perdido; por ejemplo, si la API estaba caída o la URL del túnel cambió.
+- **Red de seguridad:** el scheduler ejecuta una pasada completa cada `SYNC_INTERVAL_MINUTES`. Recupera cualquier aviso perdido; por ejemplo, si la API estaba caída o la URL del túnel rápido cambió.
 
 ### 5.2. Qué hace cada paso de la pasada
 
@@ -1108,7 +1117,8 @@ Los números de esta tabla son **estimaciones**: provienen de multiplicar las pe
 | Datos | Adjuntos de más de 25 MB no se copian | Se registra un aviso en el log | Survey123 ya reduce las fotos (`max-pixels=1280`); en Field Maps, usar un tamaño de foto reducido |
 | Datos | Tipos distintos entre Odoo y la capa (por ejemplo, teléfono entero) | Se pierde el 0 inicial; la conversión evita bucles de escritura | Usar texto para teléfonos (plantilla CSV y XLSForm) |
 | Estados | `Waiting` no se puede escribir; la lista de ArcGIS usa las etiquetas de Odoo en inglés como código | Las notas muestran los estados en inglés | Nombre visible en español en la lista de valores |
-| Despliegue | El túnel rápido de Cloudflare cambia de URL en cada reinicio y no tiene garantías de servicio | Hay que actualizar los webhooks; no es apto para producción | Túnel con nombre, dominio propio o proxy inverso con TLS |
+| Despliegue | El túnel rápido de Cloudflare cambia de URL en cada reinicio y no tiene garantías de servicio | Hay que actualizar los webhooks; no es apto para producción | ngrok con dominio fijo, túnel con nombre de Cloudflare, o proxy inverso con HTTPS en Enterprise (sección 17) |
+| Despliegue | El plan gratuito de ngrok tiene límites de uso y muestra una página de aviso a los navegadores | Adecuado para demos y pilotos, no para producción | Plan de pago, dominio propio o proxy inverso |
 | Despliegue | La Automation Rule de Odoo no reintenta si la API está caída | Se pierde el aviso | El scheduler lo recupera en la siguiente pasada |
 | Autenticación | App Authentication solo llega a los items de su lista de acceso | Error `403` con capas nuevas | Agregar cada capa a la credencial (paso 7) |
 | Autoría | `create_uid` queda como el usuario técnico. Una foto agregada sin otra edición se atribuye al último editor del punto | Atribución aproximada en ese caso | Usuario de Odoo propio para la integración |
@@ -1150,6 +1160,8 @@ Para generar claves: `python -c "import secrets; print(secrets.token_urlsafe(32)
 | Variable | Uso |
 |---|---|
 | `ODOO_DB_USER` / `ODOO_DB_PASSWORD` | Usuario y contraseña de PostgreSQL para Odoo |
+| `COMPOSE_PROFILES` | Publicación de la API: `cloudflare`, `ngrok` o vacío (Enterprise). Sección 17 |
+| `NGROK_AUTHTOKEN` / `NGROK_DOMAIN` | Token y dominio fijo de ngrok (perfil `ngrok`) |
 
 ---
 
@@ -1181,7 +1193,10 @@ Resumen de una pasada (`/sync/run`, `/sync/last`):
 | Síntoma | Causa | Solución |
 |---|---|---|
 | `/sync/run`: `403 You do not have permissions…` en los pasos de frentes | La credencial de App Authentication no tiene el item en su lista de acceso | Agregarlo en *Acceso a elementos* (paso 7) y ejecutar `docker compose restart integration-api` |
-| Los webhooks dejaron de llegar | Cambió la URL del túnel | `docker compose logs tunnel \| Select-String trycloudflare` y actualizar los tres webhooks |
+| Los webhooks dejaron de llegar después de reiniciar Docker | Cambió la URL del túnel rápido de Cloudflare | `docker compose logs tunnel \| Select-String trycloudflare` y actualizar los tres webhooks; para evitarlo, ngrok con dominio fijo (sección 17.2) |
+| No arranca ningún túnel | Falta `COMPOSE_PROFILES` en el `.env` de la raíz | `COMPOSE_PROFILES=ngrok` (o `cloudflare`) y `docker compose up -d` |
+| El contenedor `ngrok` se reinicia en bucle | `NGROK_AUTHTOKEN` o `NGROK_DOMAIN` vacíos o incorrectos | `docker compose logs ngrok` y revisar los dos valores en el `.env` de la raíz |
+| Enterprise no puede crear o entregar el webhook | URL sin HTTPS, certificado no confiable para ArcGIS Server, o versión anterior a 11.0 | Proxy inverso con el certificado del portal (sección 17.4) |
 | Un endpoint nuevo responde `404` o un cambio de código "no hace nada" | Se recreó el contenedor sin reconstruir la imagen | `docker compose up -d --build --force-recreate integration-api` |
 | Log: `La capa '…' no tiene los campos […]` | Falta ejecutar el script de preparación | Paso 5 y luego reiniciar la integración |
 | Las mismas features se actualizan en **cada** pasada | Un campo tiene otro tipo de dato en la capa que en Odoo | La conversión por tipo lo evita; si persiste, el log `actualización(es) -> oid=…` indica el campo |
@@ -1203,7 +1218,7 @@ Resumen de una pasada (`/sync/run`, `/sync/last`):
 ## 15. Seguridad
 
 - **Nunca se suben archivos `.env` al repositorio:** `.gitignore` los excluye. Las credenciales compartidas en texto plano durante las pruebas deben rotarse antes de una demostración externa.
-- **API expuesta por el túnel:**
+- **API expuesta por el túnel o por ngrok** (con Enterprise y proxy inverso, la API queda solo en la red interna):
   - `INTEGRATION_API_KEY` protege los endpoints manuales y los webhooks de Odoo y Survey123.
   - `ARCGIS_WEBHOOK_SECRET` (firma HMAC-SHA256) autentica los webhooks de capa. Va en el campo *Secret* de cada webhook.
 - **ArcGIS:** se prefiere App Authentication, que no depende de una persona ni del MFA y solo llega a los items autorizados.
@@ -1222,7 +1237,163 @@ Resumen de una pasada (`/sync/run`, `/sync/last`):
 | Volumen alto | Sincronización **incremental**: cambios de ArcGIS con `extractChanges` (ChangeTracking ya está habilitado) y tareas de Odoo filtradas por `write_date`, en lugar de leer todo en cada pasada |
 | Muchos reportes simultáneos | Claims y vínculos **en lotes** (una petición `applyEdits` por grupo) |
 | Alta disponibilidad | Cola persistente (por ejemplo Redis) y candado distribuido para correr más de una instancia |
-| Publicación estable | Túnel con nombre o dominio propio con TLS; con ArcGIS Enterprise en la misma red, sin túnel |
+| Publicación estable | Dominio propio con TLS (túnel con nombre o proxy inverso); con ArcGIS Enterprise en la misma red, IIS o Nginx sin túnel (sección 17) |
 | Trazabilidad de conflictos | Nota también cuando gana Odoo; ArcGIS Enterprise con *branch versioning* para conservar el historial de ediciones |
 | Integración nativa | Módulo de Odoo (campos de ubicación, acciones, vistas de mapa), o la API JSON-2 de Odoo 19+ en lugar de XML-RPC |
 | Operación | Métricas (duración de pasadas, errores, cola), logs estructurados y pruebas automatizadas en CI |
+
+---
+
+## 17. Publicación de la API: túnel, ngrok y ArcGIS Enterprise
+
+ArcGIS envía los webhooks a una URL **HTTPS** que debe poder alcanzar. Odoo no participa de esta decisión: siempre avisa por la red interna de Docker (`http://integration-api:8000/webhook/odoo`). Según dónde esté ArcGIS, la API se publica de una de estas formas:
+
+| Escenario | Publicación | URL | `COMPOSE_PROFILES` |
+|---|---|---|---|
+| ArcGIS Online, prueba rápida | Túnel rápido de Cloudflare | Cambia en cada reinicio del contenedor | `cloudflare` |
+| ArcGIS Online, demo o piloto | **ngrok con dominio fijo** (recomendado) | Fija | `ngrok` |
+| ArcGIS Online, dominio propio | Túnel con nombre de Cloudflare | Fija | — (ver 17.3) |
+| ArcGIS Enterprise en la red del municipio | Proxy inverso con HTTPS: IIS en Windows, Nginx en Linux | Fija, con el certificado del portal | vacío |
+
+`COMPOSE_PROFILES` se define en el `.env` de la raíz (plantilla en `.env.example`). Docker Compose lo lee solo, así que `docker compose up -d` levanta el túnel elegido junto con los demás servicios.
+
+> **Cambio respecto a versiones anteriores:** el servicio `tunnel` ya no arranca siempre. Sin `COMPOSE_PROFILES=cloudflare` (o `ngrok`) en el `.env` de la raíz, no se levanta ningún túnel.
+
+### 17.1. Túnel rápido de Cloudflare (`cloudflare`)
+
+No necesita cuenta. Cada vez que el contenedor `tunnel` arranca, Cloudflare asigna una URL `https://<palabras-al-azar>.trycloudflare.com` nueva; también ocurre con `docker compose restart` y al apagar Docker. Los webhooks quedan apuntando a la URL anterior y dejan de llegar. La integración sigue sincronizando con el scheduler (`SYNC_INTERVAL_MINUTES`), pero sin tiempo real.
+
+```powershell
+docker compose logs tunnel | Select-String trycloudflare
+```
+
+Sirve para una prueba de un día. Para una demo que se apaga y se vuelve a levantar, conviene ngrok.
+
+### 17.2. ngrok con dominio fijo (`ngrok`)
+
+El plan gratuito de ngrok incluye un dominio fijo (`<nombre>.ngrok-free.app`) que no cambia entre reinicios.
+
+1. Crear una cuenta en [ngrok.com](https://ngrok.com).
+2. En el panel de ngrok:
+   - **Your Authtoken:** copiar el token;
+   - **Domains:** copiar el dominio gratuito asignado (o crearlo si no aparece).
+3. En el `.env` de la raíz:
+   ```env
+   COMPOSE_PROFILES=ngrok
+   NGROK_AUTHTOKEN=<token de ngrok>
+   NGROK_DOMAIN=<nombre>.ngrok-free.app
+   ```
+4. Levantar los servicios. Si el túnel de Cloudflare estaba en ejecución, se detiene con `--remove-orphans`:
+   ```powershell
+   docker compose up -d --remove-orphans
+   docker compose logs ngrok --tail 20
+   ```
+5. Comprobar en el navegador `https://<nombre>.ngrok-free.app/health`, que debe responder `{"status":"ok"}`. En el plan gratuito, ngrok muestra primero una página de aviso a los navegadores; los webhooks de ArcGIS y Survey123 no la reciben.
+6. Actualizar **por última vez** las URLs de los tres webhooks (paso 11) con `https://<nombre>.ngrok-free.app/...`.
+
+El inspector de ngrok, en `http://localhost:4040`, muestra cada petición recibida con su respuesta. Es útil para comprobar que ArcGIS está enviando los webhooks.
+
+### 17.3. Túnel con nombre de Cloudflare (dominio propio)
+
+Requiere un dominio administrado en Cloudflare.
+
+1. Cloudflare → **Zero Trust → Networks → Tunnels → Create a tunnel** (tipo *Cloudflared*).
+2. Agregar un **Public hostname**, por ejemplo `integracion.dominio.com`, con servicio `HTTP` y URL `integration-api:8000`.
+3. Copiar el token del túnel y guardarlo en el `.env` de la raíz como `CLOUDFLARE_TUNNEL_TOKEN=<token>`.
+4. En `docker-compose.yml`, reemplazar el `command` del servicio `tunnel` por:
+   ```yaml
+   command: tunnel --no-autoupdate run
+   environment:
+     - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+   ```
+5. `COMPOSE_PROFILES=cloudflare` y `docker compose up -d`. La URL queda fija en `https://integracion.dominio.com`.
+
+### 17.4. ArcGIS Enterprise: proxy inverso con HTTPS
+
+Con ArcGIS Enterprise dentro de la red del municipio no hace falta túnel: Portal y ArcGIS Server llegan a la API por la red interna. Como Enterprise exige **HTTPS** en los destinos de los webhooks, delante de la API se coloca un **proxy inverso** con el certificado del portal. La API sigue corriendo en Docker, en el puerto 8000; el proxy recibe la petición HTTPS y la reenvía por dentro.
+
+```
+https://portal.muni.gob.ec/portal        → Portal (Web Adaptor)
+https://portal.muni.gob.ec/server        → ArcGIS Server (Web Adaptor)
+https://portal.muni.gob.ec/integracion   → integration-api (proxy a localhost:8000)
+```
+
+| | Windows | Linux |
+|---|---|---|
+| Web Adaptor de Enterprise | IIS | Tomcat |
+| Proxy inverso hacia la integración | IIS con URL Rewrite + ARR | Nginx (o Apache) |
+
+> **Tomcat no reemplaza a IIS en este papel.** Tomcat ejecuta aplicaciones Java, como el Web Adaptor (`.war`); la integración está escrita en Python y no se despliega dentro de Tomcat. En Linux, el proxy inverso es Nginx o Apache.
+
+#### Windows: IIS (el mismo sitio del Web Adaptor)
+
+Si el Web Adaptor ya está en IIS, el sitio (normalmente *Default Web Site*) ya tiene el enlace HTTPS en el puerto 443 con el certificado del portal. La integración se agrega como una aplicación más de ese sitio y hereda el HTTPS.
+
+1. Instalar en el servidor IIS los módulos **URL Rewrite** y **Application Request Routing (ARR)**.
+2. Habilitar el proxy: Administrador de IIS → nodo del servidor → **Application Request Routing Cache → Server Proxy Settings → Enable proxy → Aplicar**.
+3. Crear la carpeta `C:\inetpub\integracion` con este `web.config`:
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <configuration>
+     <system.webServer>
+       <rewrite>
+         <rules>
+           <rule name="integration-api" stopProcessing="true">
+             <match url="(.*)" />
+             <action type="Rewrite" url="http://localhost:8000/{R:1}" />
+           </rule>
+         </rules>
+       </rewrite>
+     </system.webServer>
+   </configuration>
+   ```
+   Si Docker corre en otra máquina, `localhost` se reemplaza por la IP o el nombre de esa máquina.
+4. En el sitio con HTTPS: **Agregar aplicación**, alias `integracion`, ruta física `C:\inetpub\integracion`.
+5. Comprobar `https://portal.muni.gob.ec/integracion/health` desde el servidor de ArcGIS. Debe responder `{"status":"ok"}`.
+
+#### Linux: Nginx
+
+Dentro del bloque `server` que escucha en el puerto 443 con el certificado del portal:
+
+```nginx
+location /integracion/ {
+    proxy_pass http://127.0.0.1:8000/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+    client_max_body_size 30m;
+}
+```
+
+Luego `sudo nginx -t && sudo systemctl reload nginx` y la misma comprobación de `/health`.
+
+Si el servidor solo tiene Tomcat, sin Nginx ni Apache, se instala Nginx en el puerto 443 delante de Tomcat y de la integración, o se publica la integración en otro puerto con su propio certificado.
+
+#### Requisitos de red y certificado
+
+- **Certificado de confianza.** Quien envía los webhooks de capa es ArcGIS Server, que debe confiar en el certificado. Sirven un certificado público o uno de la CA interna del municipio. Uno autofirmado falla, salvo que se importe en las máquinas de ArcGIS.
+- **Nombre.** La URL usa el nombre del certificado (`portal.muni.gob.ec`), no una IP.
+- **Red.** Las máquinas de Portal y ArcGIS Server deben llegar al proxy por el puerto 443.
+- **Solo red interna.** La API no queda expuesta a internet; la integración sale hacia el portal por la red local.
+
+#### Ajustes de la integración y de los webhooks con Enterprise
+
+| Tema | ArcGIS Online | ArcGIS Enterprise |
+|---|---|---|
+| `ARCGIS_URL` | `https://www.arcgis.com` | `https://portal.muni.gob.ec/portal` |
+| Credenciales | App Authentication (paso 7) | Usuario propio del portal, sin MFA, con acceso solo a las dos capas (`ARCGIS_USERNAME` / `ARCGIS_PASSWORD`) |
+| Certificado interno | — | `ARCGIS_VERIFY_CERT=True` si es de confianza. `False` solo en laboratorio. Si el nombre del portal no resuelve dentro de Docker, `extra_hosts` en `docker-compose.yml` (sección 14) |
+| Webhooks de capa | Item → Configuración → Webhooks | **Organización → Configuración → Webhooks** (*Feature layer and service webhooks*). Requiere ArcGIS Enterprise **11.0 o posterior** y rol de administrador o el privilegio correspondiente; el rol de publicador no basta |
+| URL de los webhooks | `https://<túnel o ngrok>/webhook/...` | `https://portal.muni.gob.ec/integracion/webhook/...` |
+| Webhook de Survey123 | survey123.arcgis.com | Sitio de Survey123 del portal, misma configuración (paso 11) |
+| Webhook de Odoo | `http://integration-api:8000/webhook/odoo` | Igual (red interna de Docker) |
+| `COMPOSE_PROFILES` | `cloudflare` o `ngrok` | Vacío |
+
+> **Verificar en Enterprise:** la documentación de Esri pide, para webhooks de servicios alojados, la capacidad de edición y el seguimiento de cambios (*change tracking*) habilitado sin *sync*. El script de preparación habilita Sync y ChangeTracking juntos; si el webhook no se puede crear o no se dispara, se deshabilita *Sync* en la capa y se vuelve a probar.
+
+#### Odoo dentro del portal (opcional)
+
+Odoo se puede registrar en el portal como un ERP externo: **Contenido → Nuevo elemento → Aplicación → Aplicación web**, con la URL de Odoo publicada en su propio nombre (por ejemplo `https://odoo.muni.gob.ec`, con un sitio de IIS o un `server` de Nginx que reenvíe a `http://localhost:8069`). Odoo no funciona bien bajo una subruta como `/odoo`. El elemento aparece en el contenido y puede agregarse al **lanzador de aplicaciones** del portal.
+
+Es un acceso directo: el usuario sigue iniciando sesión en Odoo con su cuenta de Odoo. Un inicio de sesión único entre Portal y Odoo (OAuth o SAML) es un proyecto aparte. La integración (`integration-api`) no se registra como aplicación: no tiene interfaz.
+
+Referencia: [Create webhooks — ArcGIS Enterprise](https://doc.esri.com/en/arcgis-enterprise/latest/administer/create-webhooks.html).
